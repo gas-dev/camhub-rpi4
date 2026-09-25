@@ -1,0 +1,13 @@
+{
+  "server_name": "CamHub-RPI4",
+  "camera_id": "CAM01",
+  "camera_name": "Camera 1",
+  "upload_token": "change-me-now",
+  "snapshot_interval_sec": 60,
+  "event_video_sec": 30,
+  "motion_enabled": false,
+  "drive_enabled": false,
+  "drive_remote": "gdrive",
+  "drive_root": "CamHub",
+  "retention_days": 7
+}
