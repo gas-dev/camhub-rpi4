@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.6.3
+## Current version: 0.6.4
 
 Architecture:
 
@@ -210,7 +210,7 @@ After updating CamHub, enter both values once and press "Collega Google Drive".
 
 ## Debug page
 
-CamHub 0.6.3 keeps technical errors out of the main dashboard.
+CamHub 0.6.4 keeps technical errors out of the main dashboard.
 
 Open:
 
@@ -249,6 +249,20 @@ Older adjacent JSON sidecars remain readable for backward compatibility. When an
 
 ## Periodic snapshots from the shared live stream
 
-CamHub 0.6.3 archives periodic still images on the Raspberry Pi from the already-running shared MJPEG stream. This removes the second ESP32 camera acquisition path that previously competed with live streaming, especially at UXGA/high JPEG quality.
+CamHub 0.6.4 archives periodic still images on the Raspberry Pi from the already-running shared MJPEG stream. This removes the second ESP32 camera acquisition path that previously competed with live streaming, especially at UXGA/high JPEG quality.
 
 The configured snapshot interval is unchanged. Periodic images are registered with source shared_live_stream, hashed, given manifest metadata and queued for Google Drive exactly like other media.
+
+
+## Manual capture from shared live stream
+
+CamHub 0.6.4 removes the legacy direct ESP32 /capture fallback from the manual capture action.
+
+Manual snapshots now:
+
+- use the already-running shared MJPEG stream only
+- wait up to 6 seconds for a fresh live frame if the cache is temporarily empty
+- archive that frame with source shared_live_stream
+- never open a second camera acquisition path on the ESP32
+
+If no recent live frame is available, CamHub returns a 503 diagnostic locally instead of asking the ESP32 for a competing direct capture.
