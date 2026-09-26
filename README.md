@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.7.0
+## Current version: 0.8.0
 
 Architecture:
 
@@ -319,3 +319,38 @@ API:
     GET  /api/camera/queue
 
 The previous continuous /api/camera/{camera_id}/live proxy is intentionally disabled in exclusive camera mode.
+
+
+## CamHub 0.8.0 camera architecture
+
+The camera path has been rebuilt around one principle: exactly one acquisition operation owns the ESP32 camera at a time.
+
+There is no persistent background MJPEG ingestion worker anymore.
+
+Automatic mode:
+
+    wait configured interval
+    -> queue one PHOTO
+    -> execute exclusive /capture
+    -> archive + SHA-256 + manifest + cloud queue
+    -> return idle
+
+Manual mode:
+
+    automatic scheduler paused
+    -> button presses create FIFO operations
+    -> one worker executes exactly one item at a time
+
+Example:
+
+    PHOTO -> PHOTO -> VIDEO -> PHOTO
+
+No two items overlap.
+
+Video is no longer expanded to hundreds of temporary JPEG files by Python. CamHub starts FFmpeg directly against the ESP32 MJPEG endpoint only for the requested recording duration, encodes H.264, closes the HTTP stream, waits for camera quiescence, then moves to the next queue item.
+
+Still capture retries transient 409/423/429/503 or connection failures up to three times before declaring the queued operation failed.
+
+The dashboard shows mode, active item, FIFO queue, and automatic countdown. Queue state refreshes every second.
+
+This architecture intentionally removes the old continuous-live cache path because it was competing with direct still capture on constrained ESP32-CAM hardware.
