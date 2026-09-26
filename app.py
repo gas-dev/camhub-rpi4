@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.6.4")
+app = FastAPI(title="CamHub", version="0.7.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -39,8 +40,16 @@ frame_lock = threading.RLock()
 frame_cache: dict[str, dict[str, Any]] = {}
 stream_workers: dict[str, threading.Thread] = {}
 stream_workers_lock = threading.Lock()
-periodic_worker_started = False
-periodic_last_capture: dict[str, float] = {}
+camera_operation_worker_started = False
+automatic_scheduler_started = False
+camera_operation_lock = threading.RLock()
+camera_operation_event = threading.Event()
+camera_operation_queue: deque[dict[str, Any]] = deque()
+camera_operation_active: dict[str, Any] | None = None
+camera_operation_history: list[dict[str, Any]] = []
+camera_operation_seq = 0
+automatic_next_due = 0.0
+automatic_last_interval = 0
 runtime_error_lock = threading.RLock()
 runtime_errors: list[dict[str, Any]] = []
 google_oauth_lock = threading.RLock()
@@ -58,6 +67,7 @@ DEFAULT_CONFIG = {
     "camera_name": "Camera 1",
     "upload_token": "change-me-now",
     "snapshot_interval_sec": 60,
+    "camera_mode": "automatic",
     "event_video_sec": 10,
     "motion_enabled": False,
     "drive_enabled": False,
@@ -88,6 +98,7 @@ class ConfigModel(BaseModel):
     camera_name: str = "Camera 1"
     upload_token: str = "change-me-now"
     snapshot_interval_sec: int = 60
+    camera_mode: str = "automatic"
     event_video_sec: int = 10
     motion_enabled: bool = False
     drive_enabled: bool = False
@@ -392,57 +403,341 @@ def ensure_stream_worker(camera_id: str) -> None:
         worker.start()
 
 
-def periodic_snapshot_worker() -> None:
+def camera_operation_status() -> dict[str, Any]:
+    with camera_operation_lock:
+        active = dict(camera_operation_active) if camera_operation_active else None
+        queued = [dict(item) for item in list(camera_operation_queue)[:25]]
+        history = [dict(item) for item in camera_operation_history[:10]]
+
+    cfg = load_config()
+    remaining = 0
+    if cfg.get("camera_mode") == "automatic" and automatic_next_due > 0:
+        remaining = max(0, int(automatic_next_due - time.monotonic()))
+
+    return {
+        "mode": cfg.get("camera_mode", "automatic"),
+        "active": active,
+        "queued": queued,
+        "queue_length": len(queued),
+        "history": history,
+        "next_automatic_in_sec": remaining,
+    }
+
+
+def enqueue_camera_operation(
+    kind: str,
+    camera_id: str,
+    duration: int = 0,
+    origin: str = "manual",
+) -> dict[str, Any]:
+    global camera_operation_seq
+
+    with camera_operation_lock:
+        camera_operation_seq += 1
+        item = {
+            "id": camera_operation_seq,
+            "kind": kind,
+            "camera_id": camera_id,
+            "duration": duration,
+            "origin": origin,
+            "status": "queued",
+            "queued_at": now_local().isoformat(),
+        }
+        camera_operation_queue.append(item)
+        position = len(camera_operation_queue)
+
+    camera_operation_event.set()
+    result = dict(item)
+    result["position"] = position
+    return result
+
+
+def _direct_camera_photo(camera_id: str, event_type: str) -> dict[str, Any]:
+    url = _node_url(camera_id, "capture_url", "/capture")
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "CamHub/0.7", "Connection": "close"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = response.read(8 * 1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Camera photo HTTP {exc.code}: {detail or exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Camera photo connection failed: {exc}") from exc
+
+    if not payload:
+        raise RuntimeError("Camera returned an empty JPEG")
+
+    dt = now_local()
+    out_path = camera_day_dir(camera_id, dt) / make_filename(
+        camera_id,
+        event_type,
+        dt,
+        ".jpg",
+    )
+    out_path.write_bytes(payload)
+    meta = register_media(
+        out_path,
+        camera_id,
+        event_type,
+        dt,
+        "exclusive_direct_capture",
+    )
+    return {
+        "file": out_path.name,
+        "sha256": meta["sha256"],
+        "size": len(payload),
+    }
+
+
+def _exclusive_camera_video(camera_id: str, seconds: int) -> dict[str, Any]:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is not installed")
+
+    cfg = load_config()
+    requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
+    stream_url = _node_url(camera_id, "stream_url", "/stream")
+    dt = now_local()
+    out_path = camera_day_dir(camera_id, dt) / make_filename(
+        camera_id,
+        f"video_{seconds}s",
+        dt,
+        ".mp4",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="camhub-exclusive-video-") as tmp:
+        temp_dir = Path(tmp)
+        frame_count = 0
+        started = time.monotonic()
+        buffer = b""
+
+        request = urllib.request.Request(
+            stream_url,
+            headers={"User-Agent": "CamHub/0.7", "Connection": "close"},
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                while time.monotonic() - started < seconds:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    buffer += chunk
+
+                    while True:
+                        start = buffer.find(b"\xff\xd8")
+                        if start < 0:
+                            if len(buffer) > 2:
+                                buffer = buffer[-2:]
+                            break
+
+                        end = buffer.find(b"\xff\xd9", start + 2)
+                        if end < 0:
+                            if start > 0:
+                                buffer = buffer[start:]
+                            if len(buffer) > 8 * 1024 * 1024:
+                                buffer = b""
+                            break
+
+                        frame = buffer[start:end + 2]
+                        buffer = buffer[end + 2:]
+                        if len(frame) > 1024:
+                            frame_count += 1
+                            (temp_dir / f"frame_{frame_count:06d}.jpg").write_bytes(frame)
+
+                        if time.monotonic() - started >= seconds:
+                            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Camera video stream HTTP {exc.code}: {detail or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Camera video stream connection failed: {exc}") from exc
+
+        elapsed = max(0.1, time.monotonic() - started)
+        if frame_count < 2:
+            raise RuntimeError(
+                f"Video stream produced only {frame_count} usable frame(s)"
+            )
+
+        source_fps = max(0.1, min(30.0, frame_count / elapsed))
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-framerate", f"{source_fps:.3f}",
+            "-i", str(temp_dir / "frame_%06d.jpg"),
+            "-an", "-c:v", "libx264", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(out_path),
+        ]
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(60, seconds + 45),
+        )
+
+    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "ffmpeg encoding failed: " + (result.stderr or result.stdout)[-1200:]
+        )
+
+    meta = register_media(
+        out_path,
+        camera_id,
+        f"video_{seconds}s",
+        dt,
+        "exclusive_mjpeg_stream",
+    )
+    return {
+        "file": out_path.name,
+        "duration": seconds,
+        "frames": frame_count,
+        "source_fps": round(source_fps, 2),
+        "requested_fps": requested_fps,
+        "resolution": cfg.get("camera_frame_size"),
+        "sha256": meta["sha256"],
+    }
+
+
+def camera_operation_worker() -> None:
+    global camera_operation_active
+
+    while True:
+        camera_operation_event.wait(timeout=1.0)
+        camera_operation_event.clear()
+
+        while True:
+            with camera_operation_lock:
+                if not camera_operation_queue:
+                    camera_operation_active = None
+                    break
+                item = camera_operation_queue.popleft()
+                item["status"] = "running"
+                item["started_at"] = now_local().isoformat()
+                camera_operation_active = item
+
+            try:
+                if item["kind"] == "photo":
+                    event_type = (
+                        "periodic"
+                        if item.get("origin") == "automatic"
+                        else "manual"
+                    )
+                    result = _direct_camera_photo(
+                        str(item["camera_id"]),
+                        event_type,
+                    )
+                elif item["kind"] == "video":
+                    result = _exclusive_camera_video(
+                        str(item["camera_id"]),
+                        max(1, int(item.get("duration") or 10)),
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unsupported camera operation: {item['kind']}"
+                    )
+
+                item["status"] = "completed"
+                item["result"] = result
+            except Exception as exc:
+                detail = str(getattr(exc, "detail", exc))
+                item["status"] = "error"
+                item["error"] = detail[-4000:]
+                record_runtime_error(
+                    "camera_operation",
+                    detail,
+                    str(item.get("camera_id") or ""),
+                )
+            finally:
+                item["finished_at"] = now_local().isoformat()
+                with camera_operation_lock:
+                    camera_operation_history.insert(0, dict(item))
+                    del camera_operation_history[25:]
+                    camera_operation_active = None
+
+
+def ensure_camera_operation_worker() -> None:
+    global camera_operation_worker_started
+    if camera_operation_worker_started:
+        return
+    camera_operation_worker_started = True
+    threading.Thread(
+        target=camera_operation_worker,
+        daemon=True,
+        name="camhub-camera-operations",
+    ).start()
+
+
+def automatic_snapshot_scheduler() -> None:
+    global automatic_next_due, automatic_last_interval
+
+    last_mode = ""
     while True:
         try:
             cfg = load_config()
-            camera_id = str(cfg.get("camera_id") or "CAM01")
+            mode = str(cfg.get("camera_mode") or "automatic")
             interval = max(1, int(cfg.get("snapshot_interval_sec", 60)))
+            camera_id = str(cfg.get("camera_id") or "CAM01")
             now_mono = time.monotonic()
 
-            ensure_stream_worker(camera_id)
-            cached = get_live_frame(camera_id, max_age=5.0)
+            if mode != "automatic":
+                automatic_next_due = 0.0
+                automatic_last_interval = interval
+                last_mode = mode
+                time.sleep(0.25)
+                continue
 
-            if cached is not None:
-                last = periodic_last_capture.get(camera_id)
+            if (
+                last_mode != "automatic"
+                or automatic_next_due <= 0
+                or automatic_last_interval != interval
+            ):
+                automatic_next_due = now_mono + interval
+                automatic_last_interval = interval
+                last_mode = "automatic"
 
-                if last is None:
-                    periodic_last_capture[camera_id] = now_mono
-                elif now_mono - last >= interval:
-                    payload = bytes(cached["frame"])
-                    if payload:
-                        dt = now_local()
-                        out_path = (
-                            camera_day_dir(camera_id, dt)
-                            / make_filename(camera_id, "periodic", dt, ".jpg")
-                        )
-                        out_path.write_bytes(payload)
-                        register_media(
-                            out_path,
-                            camera_id,
-                            "periodic",
-                            dt,
-                            "shared_live_stream",
-                        )
-                        periodic_last_capture[camera_id] = now_mono
+            if now_mono >= automatic_next_due:
+                with camera_operation_lock:
+                    periodic_pending = (
+                        camera_operation_active is not None
+                        and camera_operation_active.get("origin") == "automatic"
+                    ) or any(
+                        item.get("origin") == "automatic"
+                        for item in camera_operation_queue
+                    )
 
+                if not periodic_pending:
+                    enqueue_camera_operation(
+                        "photo",
+                        camera_id,
+                        origin="automatic",
+                    )
+
+                automatic_next_due = now_mono + interval
         except Exception as exc:
-            record_runtime_error("periodic_snapshot_worker", str(exc))
+            record_runtime_error("automatic_snapshot_scheduler", str(exc))
 
-        time.sleep(0.5)
+        time.sleep(0.25)
 
 
-def ensure_periodic_snapshot_worker() -> None:
-    global periodic_worker_started
-    if periodic_worker_started:
+def ensure_automatic_snapshot_scheduler() -> None:
+    global automatic_scheduler_started
+    if automatic_scheduler_started:
         return
-    periodic_worker_started = True
+    automatic_scheduler_started = True
     threading.Thread(
-        target=periodic_snapshot_worker,
+        target=automatic_snapshot_scheduler,
         daemon=True,
-        name="camhub-periodic-snapshot",
+        name="camhub-automatic-snapshot",
     ).start()
-
 
 def media_files() -> list[Path]:
     return [p for p in DATA_DIR.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
@@ -927,7 +1222,8 @@ def queue_cloud_sync(force: bool = False) -> None:
 def startup_event() -> None:
     load_config()
     ensure_cloud_worker()
-    ensure_periodic_snapshot_worker()
+    ensure_camera_operation_worker()
+    ensure_automatic_snapshot_scheduler()
     if load_config().get("drive_enabled"):
         queue_cloud_sync()
 
@@ -1102,6 +1398,8 @@ def set_config(cfg: ConfigModel):
     data = cfg.model_dump()
     if not 1 <= data["snapshot_interval_sec"] <= 86400:
         raise HTTPException(400, "snapshot_interval_sec must be 1..86400")
+    if data["camera_mode"] not in ("automatic", "manual"):
+        raise HTTPException(400, "camera_mode must be automatic or manual")
     if not 1 <= data["event_video_sec"] <= 60:
         raise HTTPException(400, "event_video_sec must be 1..60")
     if data["camera_frame_size"] not in FRAME_SIZES:
@@ -1145,7 +1443,7 @@ def node_config(camera_id: str, x_cam_token: str | None = Header(default=None)):
     return {
         "camera_id": camera_id,
         "snapshot_interval_sec": cfg["snapshot_interval_sec"],
-        "snapshot_source": "raspberry_live_cache",
+        "snapshot_source": "server_exclusive_queue",
         "camera_frame_size": cfg["camera_frame_size"],
         "jpeg_quality": cfg["jpeg_quality"],
         "horizontal_mirror": cfg["horizontal_mirror"],
@@ -1193,7 +1491,6 @@ async def node_heartbeat(request: Request, x_cam_token: str | None = Header(defa
     payload["last_seen"] = now_local().isoformat()
     payload["observed_ip"] = request.client.host if request.client else None
     save_node(camera_id, payload)
-    ensure_stream_worker(camera_id)
     return {"ok": True}
 
 
@@ -1206,8 +1503,7 @@ def api_nodes():
             node = json.loads(path.read_text(encoding="utf-8"))
             seen = datetime.fromisoformat(node["last_seen"])
             node["online"] = (now - seen).total_seconds() < 45
-            cached = get_live_frame(str(node.get("camera_id") or ""), max_age=5.0)
-            node["ingest_fps"] = round(float((cached or {}).get("source_fps") or 0.0), 1)
+            node["ingest_fps"] = 0.0
             nodes.append(node)
         except Exception:
             continue
@@ -1296,149 +1592,92 @@ def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]
         return False, str(exc)
 
 
+@app.post("/api/camera/mode/{mode}")
+def set_camera_mode(mode: str):
+    global automatic_next_due
+
+    normalized = mode.strip().lower()
+    if normalized not in ("automatic", "manual"):
+        raise HTTPException(400, "Mode must be automatic or manual")
+
+    cfg = load_config()
+    cfg["camera_mode"] = normalized
+    save_config(cfg)
+
+    if normalized == "manual":
+        automatic_next_due = 0.0
+        with camera_operation_lock:
+            retained = [
+                item
+                for item in camera_operation_queue
+                if item.get("origin") != "automatic"
+            ]
+            camera_operation_queue.clear()
+            camera_operation_queue.extend(retained)
+    else:
+        automatic_next_due = (
+            time.monotonic()
+            + max(1, int(cfg.get("snapshot_interval_sec", 60)))
+        )
+
+    return camera_operation_status()
+
+
+@app.get("/api/camera/queue")
+def camera_queue():
+    return camera_operation_status()
+
+
 @app.post("/api/camera/{camera_id}/capture")
 def manual_capture(camera_id: str):
-    ensure_stream_worker(camera_id)
+    cfg = load_config()
+    if cfg.get("camera_mode") != "manual":
+        raise HTTPException(
+            409,
+            "Camera is in automatic mode. Switch to manual mode before requesting a photo.",
+        )
 
-    deadline = time.monotonic() + 6.0
-    cached = get_live_frame(camera_id, max_age=5.0)
-
-    while cached is None and time.monotonic() < deadline:
-        time.sleep(0.1)
-        cached = get_live_frame(camera_id, max_age=5.0)
-
-    if cached is None:
-        message = "Manual capture unavailable because the shared live stream has no recent frame"
-        record_runtime_error("manual_capture", message, camera_id)
-        raise HTTPException(503, message)
-
-    payload = bytes(cached["frame"])
-    if not payload:
-        message = "Manual capture unavailable because the shared live frame is empty"
-        record_runtime_error("manual_capture", message, camera_id)
-        raise HTTPException(503, message)
-
-    dt = now_local()
-    out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, "manual", dt, ".jpg")
-    out_path.write_bytes(payload)
-    meta = register_media(out_path, camera_id, "manual", dt, "shared_live_stream")
+    item = enqueue_camera_operation(
+        "photo",
+        camera_id,
+        origin="manual",
+    )
     return {
         "ok": True,
-        "file": out_path.name,
-        "sha256": meta["sha256"],
-        "source": "shared_live_stream",
-        "frame_age_sec": round(max(0.0, time.monotonic() - float(cached.get("received_mono") or time.monotonic())), 3),
+        "queued": True,
+        "operation": item,
     }
 
 
 @app.post("/api/camera/{camera_id}/record")
 def record_video(camera_id: str, duration: int | None = None):
     cfg = load_config()
+    if cfg.get("camera_mode") != "manual":
+        raise HTTPException(
+            409,
+            "Camera is in automatic mode. Switch to manual mode before requesting a video.",
+        )
+
     seconds = max(1, min(int(duration or cfg["event_video_sec"]), 60))
-    requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
-
-    if shutil.which("ffmpeg") is None:
-        raise HTTPException(500, "ffmpeg is not installed")
-
-    ensure_stream_worker(camera_id)
-
-    wait_deadline = time.monotonic() + 8.0
-    while get_live_frame(camera_id, max_age=3.0) is None and time.monotonic() < wait_deadline:
-        time.sleep(0.1)
-
-    if get_live_frame(camera_id, max_age=3.0) is None:
-        raise HTTPException(502, "Live camera stream is not available")
-
-    dt = now_local()
-    out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, f"video_{seconds}s", dt, ".mp4")
-    total_frames = seconds * requested_fps
-    unique_sequences: set[int] = set()
-
-    with tempfile.TemporaryDirectory(prefix="camhub-video-") as tmp:
-        temp_dir = Path(tmp)
-        started = time.monotonic()
-
-        for frame_index in range(1, total_frames + 1):
-            target = started + ((frame_index - 1) / float(requested_fps))
-            now_mono = time.monotonic()
-            if now_mono < target:
-                time.sleep(target - now_mono)
-
-            cached = get_live_frame(camera_id, max_age=3.0)
-            if cached is None:
-                out_path.unlink(missing_ok=True)
-                raise HTTPException(502, "Camera stream interrupted during recording")
-
-            payload = bytes(cached["frame"])
-            unique_sequences.add(int(cached.get("seq") or 0))
-            (temp_dir / f"frame_{frame_index:06d}.jpg").write_bytes(payload)
-
-        command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-framerate", str(requested_fps),
-            "-i", str(temp_dir / "frame_%06d.jpg"),
-            "-an", "-c:v", "libx264", "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(out_path),
-        ]
-
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired as exc:
-            out_path.unlink(missing_ok=True)
-            raise HTTPException(504, "Video encoding timed out") from exc
-
-    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
-        out_path.unlink(missing_ok=True)
-        raise HTTPException(502, "ffmpeg encoding failed: " + (result.stderr or result.stdout)[-1200:])
-
-    meta = register_media(out_path, camera_id, f"video_{seconds}s", dt, "shared_live_stream")
+    item = enqueue_camera_operation(
+        "video",
+        camera_id,
+        duration=seconds,
+        origin="manual",
+    )
     return {
         "ok": True,
-        "file": out_path.name,
-        "duration": seconds,
-        "frames": total_frames,
-        "fps": requested_fps,
-        "unique_source_frames": len(unique_sequences),
-        "resolution": cfg.get("camera_frame_size"),
-        "sha256": meta["sha256"],
+        "queued": True,
+        "operation": item,
     }
 
 
 @app.get("/api/camera/{camera_id}/live")
 def live_proxy(camera_id: str):
-    ensure_stream_worker(camera_id)
-
-    def generate():
-        last_seq = -1
-        while True:
-            cfg = load_config()
-            fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
-            item = get_live_frame(camera_id, max_age=5.0)
-
-            if item is None:
-                time.sleep(0.1)
-                continue
-
-            seq = int(item.get("seq") or 0)
-            if seq == last_seq:
-                time.sleep(min(0.1, 1.0 / fps))
-                continue
-
-            last_seq = seq
-            frame = bytes(item["frame"])
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
-                + frame
-                + b"\r\n"
-            )
-
-    return StreamingResponse(
-        generate(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    raise HTTPException(
+        409,
+        "Continuous live streaming is disabled in exclusive camera mode. "
+        "Use automatic snapshots or queue a manual photo/video.",
     )
 
 
@@ -1505,6 +1744,8 @@ def api_status():
         "pending_cloud": pending,
         "cloud_backoff": backoff,
         "drive_custom_oauth": has_custom_drive_oauth(str(cfg.get("drive_remote") or "gdrive")),
+        "camera_mode": cfg.get("camera_mode", "automatic"),
+        "camera_queue": camera_operation_status(),
         "latest_name": latest.name if latest else None,
         "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
     }
