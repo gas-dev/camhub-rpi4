@@ -20,12 +20,13 @@ from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
+GOOGLE_OAUTH_PATH = BASE_DIR / "google_oauth.json"
 DATA_DIR = BASE_DIR / "data"
 NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.6.0")
+app = FastAPI(title="CamHub", version="0.6.1")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -110,6 +111,36 @@ def save_config(cfg: dict[str, Any]) -> None:
         tmp = CONFIG_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         tmp.replace(CONFIG_PATH)
+
+
+def load_google_oauth_credentials() -> dict[str, str]:
+    if not GOOGLE_OAUTH_PATH.exists():
+        return {"client_id": "", "client_secret": ""}
+    try:
+        data = json.loads(GOOGLE_OAUTH_PATH.read_text(encoding="utf-8"))
+        return {
+            "client_id": str(data.get("client_id") or "").strip(),
+            "client_secret": str(data.get("client_secret") or "").strip(),
+        }
+    except Exception:
+        return {"client_id": "", "client_secret": ""}
+
+
+def save_google_oauth_credentials(client_id: str, client_secret: str) -> None:
+    tmp = GOOGLE_OAUTH_PATH.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "client_id": client_id.strip(),
+                "client_secret": client_secret.strip(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    tmp.chmod(0o600)
+    tmp.replace(GOOGLE_OAUTH_PATH)
+    GOOGLE_OAUTH_PATH.chmod(0o600)
 
 
 def load_config() -> dict[str, Any]:
@@ -577,7 +608,7 @@ def google_form_post(url: str, data: dict[str, str], timeout: int = 20) -> dict[
         return payload
 
 
-def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any]) -> tuple[bool, str]:
+def configure_rclone_device_token(client_id: str, client_secret: str, token_payload: dict[str, Any]) -> tuple[bool, str]:
     cfg = load_config()
     remote = str(cfg.get("drive_remote") or "gdrive")
     root = str(cfg.get("drive_root") or "CamHub").strip("/")
@@ -629,7 +660,7 @@ def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any])
         command = [
             "rclone", "config", "update", remote,
             "client_id", client_id,
-            "client_secret", "",
+            "client_secret", client_secret,
             "scope", "drive.file",
             "token", rclone_token,
             "config_refresh_token", "false",
@@ -639,7 +670,7 @@ def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any])
         command = [
             "rclone", "config", "create", remote, "drive",
             "client_id", client_id,
-            "client_secret", "",
+            "client_secret", client_secret,
             "scope", "drive.file",
             "token", rclone_token,
             "config_refresh_token", "false",
@@ -675,7 +706,7 @@ def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any])
     return True, "Google Drive connected. Token stored locally in rclone configuration."
 
 
-def google_device_oauth_worker(client_id: str, device_code: str, interval: int, expires_at: float) -> None:
+def google_device_oauth_worker(client_id: str, client_secret: str, device_code: str, interval: int, expires_at: float) -> None:
     wait_seconds = max(2, interval)
 
     while time.time() < expires_at:
@@ -684,6 +715,7 @@ def google_device_oauth_worker(client_id: str, device_code: str, interval: int, 
             "https://oauth2.googleapis.com/token",
             {
                 "client_id": client_id,
+                "client_secret": client_secret,
                 "device_code": device_code,
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             },
@@ -691,7 +723,7 @@ def google_device_oauth_worker(client_id: str, device_code: str, interval: int, 
         )
 
         if payload.get("access_token"):
-            ok, message = configure_rclone_device_token(client_id, payload)
+            ok, message = configure_rclone_device_token(client_id, client_secret, payload)
             with google_oauth_lock:
                 google_oauth_state.update({
                     "status": "connected" if ok else "error",
@@ -865,7 +897,8 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label>Retention locale, giorni<input id="retention_days" type="number" min="1"></label>
 <label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
 <label>Google OAuth Client ID<input id="google_oauth_client_id" type="text" placeholder="...apps.googleusercontent.com"></label>
-<div class="muted">Per la connessione dal pannello usa un OAuth Client Google di tipo TV / Limited Input Device. Il token non viene mostrato né inviato al browser.</div>
+<label>Google OAuth Client Secret<input id="google_oauth_client_secret" type="password" autocomplete="new-password" placeholder="Inseriscilo solo la prima volta"></label>
+<div class="muted">Il Client Secret è necessario al device flow Google. Viene salvato solo sul Raspberry in un file locale protetto e non viene mai mostrato di nuovo nel browser. Se è già configurato, lascia il campo vuoto.</div>
 <div class="actions"><button type="button" onclick="connectGoogle()">Collega Google Drive</button><button type="button" onclick="disconnectGoogle()">Disconnetti Google Drive</button></div>
 <div id="googleConnect" class="muted"></div>
 <label>Attesa batch cloud, secondi<input id="cloud_batch_delay_sec" type="number" min="0" max="60"></label>
@@ -908,9 +941,10 @@ let googlePoll=null;
 async function connectGoogle(){
  const box=document.getElementById('googleConnect');
  const clientId=document.getElementById('google_oauth_client_id').value.trim();
+ const clientSecret=document.getElementById('google_oauth_client_secret').value.trim();
  if(!clientId){box.innerHTML='<span class="bad">Inserisci prima il Google OAuth Client ID.</span>';return}
  box.textContent='Avvio collegamento Google...';
- const r=await fetch('/api/cloud/oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:clientId})});
+ const r=await fetch('/api/cloud/oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:clientId,client_secret:clientSecret})});
  const j=await r.json();
  if(!r.ok){box.textContent='Errore OAuth: '+(j.detail||JSON.stringify(j));return}
  box.innerHTML='<div><b>Codice Google:</b> <span class="mono" style="font-size:18px">'+j.user_code+'</span></div><div>Si apre Google in una nuova scheda. Accedi, inserisci il codice e autorizza CamHub.</div><div><a href="'+j.verification_url+'" target="_blank" rel="noopener">Apri Google per autorizzare</a></div><div id="googleOauthState">In attesa di autorizzazione...</div>';
@@ -1390,9 +1424,26 @@ def test_cloud():
 async def start_google_oauth(request: Request):
     payload = await request.json()
     client_id = str(payload.get("client_id") or "").strip()
+    supplied_secret = str(payload.get("client_secret") or "").strip()
 
     if not client_id:
         raise HTTPException(400, "Google OAuth Client ID is required")
+
+    saved_credentials = load_google_oauth_credentials()
+    client_secret = supplied_secret
+
+    if not client_secret and saved_credentials.get("client_id") == client_id:
+        client_secret = saved_credentials.get("client_secret", "")
+
+    if not client_secret:
+        raise HTTPException(
+            400,
+            "Google OAuth Client Secret is required the first time. "
+            "Open this OAuth client in Google Cloud Console and copy its Client Secret."
+        )
+
+    if supplied_secret:
+        save_google_oauth_credentials(client_id, client_secret)
 
     result = google_form_post(
         "https://oauth2.googleapis.com/device/code",
@@ -1434,7 +1485,7 @@ async def start_google_oauth(request: Request):
 
     threading.Thread(
         target=google_device_oauth_worker,
-        args=(client_id, str(result["device_code"]), interval, expires_at),
+        args=(client_id, client_secret, str(result["device_code"]), interval, expires_at),
         daemon=True,
         name="camhub-google-oauth",
     ).start()
@@ -1452,7 +1503,10 @@ async def start_google_oauth(request: Request):
 @app.get("/api/cloud/oauth/status")
 def google_oauth_status():
     state = google_oauth_public_status()
+    credentials = load_google_oauth_credentials()
     state["connected"] = has_custom_drive_oauth(str(load_config().get("drive_remote") or "gdrive"))
+    state["client_secret_configured"] = bool(credentials.get("client_secret"))
+    state["configured_client_id"] = credentials.get("client_id", "")
     return state
 
 
