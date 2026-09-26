@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.5.1
+## Current version: 0.5.3
 
 Architecture:
 
@@ -96,3 +96,57 @@ Camera error files use names similar to:
     CAM01_CAMERA_ERROR_SNAPSHOT_CAPTURE_YYYYMMDD_HHMMSS_mmm.txt
 
 A cloud ERROR does not by itself mean the camera failed. If the image/video exists locally with size and SHA-256, acquisition succeeded and the failure happened during cloud synchronization.
+
+
+## Google Drive production configuration
+
+CamHub 0.5.3 is designed to avoid relying on rclone's shared/default Google OAuth project.
+
+Recommended configuration:
+
+1. Create a Google Cloud project owned by the deployment owner.
+2. Enable Google Drive API for that project.
+3. Configure the OAuth consent screen as appropriate for the deployment.
+4. Create an OAuth Client ID of type Desktop app.
+5. On the Raspberry Pi run:
+
+    chmod +x setup_gdrive_oauth.sh
+    ./setup_gdrive_oauth.sh
+
+The script asks interactively for the Client ID and Client Secret. Credentials are written only to the local rclone configuration and are never committed to Git.
+
+For a headless Raspberry Pi, rclone may ask you to authorize from another computer with a browser. Follow the URL/remote-authorization instructions printed by rclone.
+
+After authorization, the script tests the configured remote.
+
+The CamHub dashboard shows:
+
+    OAuth dedicato configurato
+
+when a client_id is present for the configured rclone remote.
+
+## Google Drive rate limiting
+
+CamHub now protects the Drive API in several ways:
+
+- pending files are coalesced before cloud transfer
+- rclone traffic is capped with a configurable TPS limit
+- transfers/checkers are kept conservative
+- destination traversal is avoided for targeted file batches
+- Google RATE_LIMIT_EXCEEDED responses trigger an automatic backoff
+- the cloud worker wakes periodically and retries pending files after backoff expires
+- local acquisition continues while Drive is unavailable
+
+Default cloud protection:
+
+    cloud_batch_delay_sec = 5
+    cloud_rate_limit_backoff_sec = 600
+    cloud_tps_limit = 8
+
+These values can be changed from the dashboard.
+
+## Cloud health test
+
+The dashboard includes Test Google Drive.
+
+It verifies the configured remote/root and reports whether a dedicated OAuth client is configured. The detailed rclone response is shown directly in the web interface and is also available in recent error diagnostics when the test fails.
