@@ -23,5 +23,7 @@ echo "  $APP_DIR/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --app-dir 
 echo
 echo "Then open: http://RASPBERRY_IP:8080"
 echo "Configure Google Drive with your own OAuth client:"
-echo "  chmod +x setup_gdrive_oauth.sh"
-echo "  ./setup_gdrive_oauth.sh"
+echo "  bash setup_gdrive_oauth.sh"
+echo
+echo "Cloud diagnostic:"
+echo "  bash diagnose_cloud.sh"
