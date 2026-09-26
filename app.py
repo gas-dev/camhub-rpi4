@@ -1620,6 +1620,7 @@ def set_camera_mode(mode: str):
     cfg["camera_mode"] = normalized
     save_config(cfg)
 
+    cancelled = 0
     if normalized == "manual":
         automatic_next_due = 0.0
         with camera_operation_lock:
@@ -1628,15 +1629,28 @@ def set_camera_mode(mode: str):
                 for item in camera_operation_queue
                 if item.get("origin") != "automatic"
             ]
+            cancelled = len(camera_operation_queue) - len(retained)
             camera_operation_queue.clear()
             camera_operation_queue.extend(retained)
     else:
+        with camera_operation_lock:
+            retained = [
+                item
+                for item in camera_operation_queue
+                if item.get("origin") == "automatic"
+            ]
+            cancelled = len(camera_operation_queue) - len(retained)
+            camera_operation_queue.clear()
+            camera_operation_queue.extend(retained)
+
         automatic_next_due = (
             time.monotonic()
             + max(1, int(cfg.get("snapshot_interval_sec", 60)))
         )
 
-    return camera_operation_status()
+    result = camera_operation_status()
+    result["cancelled_queued_from_previous_mode"] = cancelled
+    return result
 
 
 @app.get("/api/camera/queue")
