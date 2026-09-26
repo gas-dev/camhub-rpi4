@@ -9,7 +9,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.5.3")
+app = FastAPI(title="CamHub", version="0.6.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -39,6 +40,14 @@ stream_workers: dict[str, threading.Thread] = {}
 stream_workers_lock = threading.Lock()
 runtime_error_lock = threading.RLock()
 runtime_errors: list[dict[str, Any]] = []
+google_oauth_lock = threading.RLock()
+google_oauth_state: dict[str, Any] = {
+    "status": "idle",
+    "message": "",
+    "user_code": "",
+    "verification_url": "",
+    "expires_at": 0.0,
+}
 
 DEFAULT_CONFIG = {
     "server_name": "CamHub-RPI4",
@@ -63,6 +72,7 @@ DEFAULT_CONFIG = {
     "cloud_batch_delay_sec": 5,
     "cloud_rate_limit_backoff_sec": 600,
     "cloud_tps_limit": 8,
+    "google_oauth_client_id": "",
 }
 
 FRAME_SIZES = {"VGA", "SVGA", "XGA", "HD", "SXGA", "UXGA"}
@@ -92,6 +102,7 @@ class ConfigModel(BaseModel):
     cloud_batch_delay_sec: int = 5
     cloud_rate_limit_backoff_sec: int = 600
     cloud_tps_limit: int = 8
+    google_oauth_client_id: str = ""
 
 
 def save_config(cfg: dict[str, Any]) -> None:
@@ -537,6 +548,194 @@ def is_rate_limit_error(message: str) -> bool:
     )
 
 
+def google_oauth_public_status() -> dict[str, Any]:
+    with google_oauth_lock:
+        state = dict(google_oauth_state)
+    state.pop("device_code", None)
+    state.pop("client_id", None)
+    return state
+
+
+def google_form_post(url: str, data: dict[str, str], timeout: int = 20) -> dict[str, Any]:
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {"error": f"HTTP {exc.code}", "error_description": body}
+        payload["_http_status"] = exc.code
+        return payload
+
+
+def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any]) -> tuple[bool, str]:
+    cfg = load_config()
+    remote = str(cfg.get("drive_remote") or "gdrive")
+    root = str(cfg.get("drive_root") or "CamHub").strip("/")
+    refresh_token = str(token_payload.get("refresh_token") or "")
+    access_token = str(token_payload.get("access_token") or "")
+    expires_in = int(token_payload.get("expires_in") or 3600)
+
+    if not refresh_token or not access_token:
+        return False, "Google did not return both access_token and refresh_token."
+
+    expiry = (
+        datetime.now(timezone.utc) + timedelta(seconds=max(60, expires_in))
+    ).isoformat().replace("+00:00", "Z")
+
+    rclone_token = json.dumps(
+        {
+            "access_token": access_token,
+            "token_type": str(token_payload.get("token_type") or "Bearer"),
+            "refresh_token": refresh_token,
+            "expiry": expiry,
+        },
+        separators=(",", ":"),
+    )
+
+    config_path = rclone_config_path()
+    if config_path and config_path.exists():
+        backup = config_path.with_name(
+            config_path.name + ".backup." + now_local().strftime("%Y%m%d_%H%M%S")
+        )
+        try:
+            shutil.copy2(config_path, backup)
+            backup.chmod(0o600)
+        except Exception:
+            pass
+
+    exists = False
+    try:
+        listed = subprocess.run(
+            ["rclone", "listremotes"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        exists = f"{remote}:" in (listed.stdout or "").splitlines()
+    except Exception:
+        pass
+
+    if exists:
+        command = [
+            "rclone", "config", "update", remote,
+            "type", "drive",
+            "client_id", client_id,
+            "client_secret", "",
+            "scope", "drive.file",
+            "token", rclone_token,
+        ]
+    else:
+        command = [
+            "rclone", "config", "create", remote, "drive",
+            "client_id", client_id,
+            "client_secret", "",
+            "scope", "drive.file",
+            "token", rclone_token,
+        ]
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except Exception as exc:
+        return False, f"Unable to update rclone configuration: {exc}"
+
+    if result.returncode != 0:
+        return False, ((result.stderr or "") or (result.stdout or ""))[-4000:]
+
+    try:
+        mk = subprocess.run(
+            [
+                "rclone", "mkdir", f"{remote}:{root}",
+                "--tpslimit", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+                "--tpslimit-burst", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if mk.returncode != 0:
+            return False, ((mk.stderr or "") or (mk.stdout or ""))[-4000:]
+    except Exception as exc:
+        return False, f"OAuth saved but Drive root setup failed: {exc}"
+
+    clear_cloud_backoff()
+    queue_cloud_sync(force=True)
+    return True, "Google Drive connected. Token stored locally in rclone configuration."
+
+
+def google_device_oauth_worker(client_id: str, device_code: str, interval: int, expires_at: float) -> None:
+    wait_seconds = max(2, interval)
+
+    while time.time() < expires_at:
+        time.sleep(wait_seconds)
+        payload = google_form_post(
+            "https://oauth2.googleapis.com/token",
+            {
+                "client_id": client_id,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            },
+            timeout=20,
+        )
+
+        if payload.get("access_token"):
+            ok, message = configure_rclone_device_token(client_id, payload)
+            with google_oauth_lock:
+                google_oauth_state.update({
+                    "status": "connected" if ok else "error",
+                    "message": message,
+                    "user_code": "",
+                    "verification_url": "",
+                    "expires_at": 0.0,
+                })
+            if not ok:
+                record_runtime_error("google_oauth", message)
+            return
+
+        error = str(payload.get("error") or "")
+        description = str(payload.get("error_description") or error)
+
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            wait_seconds += 5
+            continue
+        if error in ("access_denied", "expired_token"):
+            with google_oauth_lock:
+                google_oauth_state.update({
+                    "status": "error",
+                    "message": description,
+                    "expires_at": 0.0,
+                })
+            record_runtime_error("google_oauth", description)
+            return
+
+        with google_oauth_lock:
+            google_oauth_state.update({
+                "status": "error",
+                "message": description or "Unknown Google OAuth error",
+                "expires_at": 0.0,
+            })
+        record_runtime_error("google_oauth", description or "Unknown Google OAuth error")
+        return
+
+    with google_oauth_lock:
+        google_oauth_state.update({
+            "status": "error",
+            "message": "Google authorization code expired. Start the connection again.",
+            "expires_at": 0.0,
+        })
+
+
 def rclone_config_path() -> Path | None:
     if shutil.which("rclone") is None:
         return None
@@ -662,6 +861,10 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label>Durata registrazione, secondi<input id="event_video_sec" type="number" min="1" max="60"></label>
 <label>Retention locale, giorni<input id="retention_days" type="number" min="1"></label>
 <label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
+<label>Google OAuth Client ID<input id="google_oauth_client_id" type="text" placeholder="...apps.googleusercontent.com"></label>
+<div class="muted">Per la connessione dal pannello usa un OAuth Client Google di tipo TV / Limited Input Device. Il token non viene mostrato né inviato al browser.</div>
+<div class="actions"><button type="button" onclick="connectGoogle()">Collega Google Drive</button><button type="button" onclick="disconnectGoogle()">Disconnetti Google Drive</button></div>
+<div id="googleConnect" class="muted"></div>
 <label>Attesa batch cloud, secondi<input id="cloud_batch_delay_sec" type="number" min="0" max="60"></label>
 <label>Pausa su rate limit, secondi<input id="cloud_rate_limit_backoff_sec" type="number" min="60" max="86400"></label>
 <label>Limite richieste rclone al secondo<input id="cloud_tps_limit" type="number" min="1" max="100"></label>
@@ -680,7 +883,7 @@ async function refresh(){
  document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+' · '+oauthText+'<br>Pendenti cloud: '+st.pending_cloud+boText;
  if(st.latest_url){document.getElementById('latest').src=st.latest_url+'?t='+Date.now();document.getElementById('latestInfo').textContent=st.latest_name||''}
  cfg=await fetch('/api/config').then(r=>r.json());
- for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit']) document.getElementById(k).value=cfg[k];
+ for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit','google_oauth_client_id']) document.getElementById(k).value=cfg[k]??'';
  for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
  document.getElementById('recordButton').textContent='Registra '+(cfg.event_video_sec||10)+' secondi';
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
@@ -693,11 +896,42 @@ async function refresh(){
 }
 function showMediaError(i){const x=recentMedia[i];const detail=x.cloud_error||x.error_message||'Nessun dettaglio disponibile';const box=document.getElementById('errors');box.innerHTML='';const h=document.createElement('div');h.className='bad';h.textContent=(x.file||'')+' · '+(x.cloud_status||'');const p=document.createElement('pre');p.style.cssText='white-space:pre-wrap;word-break:break-word';p.textContent=detail;box.appendChild(h);box.appendChild(p);box.scrollIntoView({behavior:'smooth'})}
 async function apiErrorText(r){try{const j=await r.json();return j.detail||j.error||JSON.stringify(j)}catch(e){try{return await r.text()}catch(e2){return 'Errore HTTP '+r.status}}}
-async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
+async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.google_oauth_client_id=document.getElementById('google_oauth_client_id').value.trim();c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
 async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore scatto: '+await apiErrorText(r);setTimeout(refresh,1000)}
 async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,800)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent=j.paused?'Google Drive è temporaneamente in pausa per rate limit. Riprova tra '+j.remaining_sec+' secondi.':(r.ok?'Sincronizzazione avviata.':'Errore cloud');setTimeout(refresh,1500)}
 async function testDrive(){const e=document.getElementById('actionResult');e.textContent='Test Google Drive in corso...';const r=await fetch('/api/cloud/test',{method:'POST'});const j=await r.json();e.textContent=(j.ok?'Google Drive OK. ':'Google Drive ERRORE. ')+(j.custom_oauth?'OAuth dedicato configurato. ':'OAuth dedicato NON configurato. ')+(j.detail||'');setTimeout(refresh,1000)}
+let googlePoll=null;
+async function connectGoogle(){
+ const box=document.getElementById('googleConnect');
+ const clientId=document.getElementById('google_oauth_client_id').value.trim();
+ if(!clientId){box.innerHTML='<span class="bad">Inserisci prima il Google OAuth Client ID.</span>';return}
+ box.textContent='Avvio collegamento Google...';
+ const r=await fetch('/api/cloud/oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:clientId})});
+ const j=await r.json();
+ if(!r.ok){box.textContent='Errore OAuth: '+(j.detail||JSON.stringify(j));return}
+ box.innerHTML='<div><b>Codice Google:</b> <span class="mono" style="font-size:18px">'+j.user_code+'</span></div><div>Si apre Google in una nuova scheda. Accedi, inserisci il codice e autorizza CamHub.</div><div><a href="'+j.verification_url+'" target="_blank" rel="noopener">Apri Google per autorizzare</a></div><div id="googleOauthState">In attesa di autorizzazione...</div>';
+ window.open(j.verification_url,'_blank','noopener');
+ if(googlePoll)clearInterval(googlePoll);
+ googlePoll=setInterval(checkGoogleOauth,2000);
+}
+async function checkGoogleOauth(){
+ const r=await fetch('/api/cloud/oauth/status');
+ const j=await r.json();
+ const state=document.getElementById('googleOauthState');
+ if(state)state.textContent=j.status==='pending'?'In attesa di autorizzazione Google...':(j.message||j.status);
+ if(j.status==='connected'||j.status==='error'){
+   if(googlePoll){clearInterval(googlePoll);googlePoll=null}
+   setTimeout(refresh,600);
+ }
+}
+async function disconnectGoogle(){
+ if(!confirm('Disconnettere Google Drive da CamHub? I file locali non verranno eliminati.'))return;
+ const r=await fetch('/api/cloud/oauth/disconnect',{method:'POST'});
+ const j=await r.json();
+ document.getElementById('googleConnect').textContent=j.message||'Google Drive disconnesso.';
+ setTimeout(refresh,600);
+}
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
 refresh();setInterval(refresh,10000);
 </script></body></html>
@@ -1147,6 +1381,106 @@ def test_cloud():
     if not result["ok"]:
         record_runtime_error("google_drive_test", result.get("detail", "Google Drive test failed"))
     return result
+
+
+@app.post("/api/cloud/oauth/start")
+async def start_google_oauth(request: Request):
+    payload = await request.json()
+    client_id = str(payload.get("client_id") or "").strip()
+
+    if not client_id:
+        raise HTTPException(400, "Google OAuth Client ID is required")
+
+    result = google_form_post(
+        "https://oauth2.googleapis.com/device/code",
+        {
+            "client_id": client_id,
+            "scope": "https://www.googleapis.com/auth/drive.file",
+        },
+        timeout=20,
+    )
+
+    if not result.get("device_code"):
+        detail = str(result.get("error_description") or result.get("error") or result)
+        record_runtime_error("google_oauth", detail)
+        raise HTTPException(502, detail)
+
+    cfg = load_config()
+    cfg["google_oauth_client_id"] = client_id
+    save_config(cfg)
+
+    expires_in = int(result.get("expires_in") or 1800)
+    interval = int(result.get("interval") or 5)
+    verification_url = str(
+        result.get("verification_url")
+        or result.get("verification_uri")
+        or "https://www.google.com/device"
+    )
+    expires_at = time.time() + expires_in
+
+    with google_oauth_lock:
+        google_oauth_state.update({
+            "status": "pending",
+            "message": "Waiting for Google authorization.",
+            "user_code": str(result.get("user_code") or ""),
+            "verification_url": verification_url,
+            "expires_at": expires_at,
+            "device_code": str(result["device_code"]),
+            "client_id": client_id,
+        })
+
+    threading.Thread(
+        target=google_device_oauth_worker,
+        args=(client_id, str(result["device_code"]), interval, expires_at),
+        daemon=True,
+        name="camhub-google-oauth",
+    ).start()
+
+    return {
+        "ok": True,
+        "status": "pending",
+        "user_code": str(result.get("user_code") or ""),
+        "verification_url": verification_url,
+        "expires_in": expires_in,
+        "scope": "drive.file",
+    }
+
+
+@app.get("/api/cloud/oauth/status")
+def google_oauth_status():
+    state = google_oauth_public_status()
+    state["connected"] = has_custom_drive_oauth(str(load_config().get("drive_remote") or "gdrive"))
+    return state
+
+
+@app.post("/api/cloud/oauth/disconnect")
+def disconnect_google_oauth():
+    cfg = load_config()
+    remote = str(cfg.get("drive_remote") or "gdrive")
+
+    try:
+        result = subprocess.run(
+            ["rclone", "config", "disconnect", f"{remote}:"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        detail = ((result.stderr or "") or (result.stdout or "")).strip()
+        if result.returncode != 0:
+            raise HTTPException(502, detail or "rclone disconnect failed")
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "Google Drive disconnect timed out") from exc
+
+    with google_oauth_lock:
+        google_oauth_state.update({
+            "status": "idle",
+            "message": "Google Drive disconnected.",
+            "user_code": "",
+            "verification_url": "",
+            "expires_at": 0.0,
+        })
+
+    return {"ok": True, "message": "Google Drive disconnected from CamHub."}
 
 
 @app.post("/api/maintenance/cleanup")
