@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -17,7 +17,7 @@ CONFIG_PATH = BASE_DIR / "config.json"
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub V1", version="0.1.0")
+app = FastAPI(title="CamHub V1", version="0.2.0")
 config_lock = threading.RLock()
 
 DEFAULT_CONFIG = {
@@ -371,6 +371,63 @@ async def upload_image(
         "ok": True,
         "file": filename,
         "relative": out_path.relative_to(DATA_DIR).as_posix(),
+    }
+
+
+@app.post("/api/upload/raw")
+async def upload_raw_image(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    camera_id: str | None = None,
+    event_type: str = "periodic",
+    x_cam_token: str | None = Header(default=None),
+):
+    """Receive a raw JPEG body from low-resource camera nodes such as ESP32-CAM."""
+    cfg = load_config()
+    if x_cam_token != cfg["upload_token"]:
+        raise HTTPException(401, "Invalid camera token")
+
+    content_type = request.headers.get("content-type", "")
+    if not content_type.lower().startswith("image/jpeg"):
+        raise HTTPException(415, "Content-Type must be image/jpeg")
+
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(400, "Empty JPEG body")
+    if len(payload) > 8 * 1024 * 1024:
+        raise HTTPException(413, "Image too large")
+
+    camera = camera_id or cfg["camera_id"]
+    dt = now_local()
+    out_dir = camera_day_dir(camera, dt)
+    safe_event = "".join(
+        char for char in event_type.upper() if char.isalnum() or char in "_-"
+    )[:24] or "PHOTO"
+
+    filename = f"{camera}_{safe_event}_{dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
+    out_path = out_dir / filename
+    out_path.write_bytes(payload)
+
+    meta = {
+        "camera_id": camera,
+        "event_type": event_type,
+        "captured_at": dt.isoformat(),
+        "received_at": now_local().isoformat(),
+        "filename": filename,
+        "size": len(payload),
+        "source": "raw_jpeg",
+        "cloud_status": "PENDING" if cfg.get("drive_enabled") else "DISABLED",
+    }
+    write_metadata(out_path, meta)
+
+    if cfg.get("drive_enabled"):
+        background_tasks.add_task(upload_to_drive, out_path)
+
+    return {
+        "ok": True,
+        "file": filename,
+        "relative": out_path.relative_to(DATA_DIR).as_posix(),
+        "size": len(payload),
     }
 
 
