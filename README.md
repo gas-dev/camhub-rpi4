@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.6.4
+## Current version: 0.7.0
 
 Architecture:
 
@@ -210,7 +210,7 @@ After updating CamHub, enter both values once and press "Collega Google Drive".
 
 ## Debug page
 
-CamHub 0.6.4 keeps technical errors out of the main dashboard.
+CamHub 0.7.0 keeps technical errors out of the main dashboard.
 
 Open:
 
@@ -249,14 +249,14 @@ Older adjacent JSON sidecars remain readable for backward compatibility. When an
 
 ## Periodic snapshots from the shared live stream
 
-CamHub 0.6.4 archives periodic still images on the Raspberry Pi from the already-running shared MJPEG stream. This removes the second ESP32 camera acquisition path that previously competed with live streaming, especially at UXGA/high JPEG quality.
+CamHub 0.7.0 archives periodic still images on the Raspberry Pi from the already-running shared MJPEG stream. This removes the second ESP32 camera acquisition path that previously competed with live streaming, especially at UXGA/high JPEG quality.
 
 The configured snapshot interval is unchanged. Periodic images are registered with source shared_live_stream, hashed, given manifest metadata and queued for Google Drive exactly like other media.
 
 
 ## Manual capture from shared live stream
 
-CamHub 0.6.4 removes the legacy direct ESP32 /capture fallback from the manual capture action.
+CamHub 0.7.0 removes the legacy direct ESP32 /capture fallback from the manual capture action.
 
 Manual snapshots now:
 
@@ -266,3 +266,56 @@ Manual snapshots now:
 - never open a second camera acquisition path on the ESP32
 
 If no recent live frame is available, CamHub returns a 503 diagnostic locally instead of asking the ESP32 for a competing direct capture.
+
+
+## CamHub 0.7.0 exclusive camera operation model
+
+CamHub now isolates camera functions instead of keeping multiple acquisition paths active at the same time.
+
+Camera modes:
+
+    AUTOMATIC
+    - no continuous MJPEG stream
+    - one exclusive direct JPEG capture at snapshot_interval_sec
+    - default interval: 60 seconds
+    - manual Photo/Video buttons are disabled
+
+    MANUAL
+    - automatic acquisition is stopped
+    - Photo and Video requests are appended to a FIFO queue
+    - exactly one camera operation is executed at a time
+    - multiple button presses remain queued in their original order
+
+Examples:
+
+    Photo -> Photo -> Video -> Photo
+
+is executed exactly in that sequence.
+
+Video behavior:
+
+- the MJPEG stream is opened only when a queued video operation starts
+- the stream is closed when the requested recording duration finishes
+- FFmpeg encodes the received JPEG sequence into MP4
+- no continuous background live stream is kept open
+
+Photo behavior:
+
+- automatic and manual photos use the ESP32 /capture endpoint exclusively
+- there is no simultaneous video/live acquisition when a photo is requested
+
+Dashboard:
+
+- explicit Automatico / Manuale mode buttons
+- current active operation
+- FIFO queue length and queued operations
+- countdown to the next automatic photo
+- manual buttons are available only in Manual mode
+
+API:
+
+    POST /api/camera/mode/automatic
+    POST /api/camera/mode/manual
+    GET  /api/camera/queue
+
+The previous continuous /api/camera/{camera_id}/live proxy is intentionally disabled in exclusive camera mode.
