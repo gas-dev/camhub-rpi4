@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,11 +24,16 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.4.1")
+app = FastAPI(title="CamHub", version="0.5.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
 cloud_worker_started = False
+
+frame_lock = threading.RLock()
+frame_cache: dict[str, dict[str, Any]] = {}
+stream_workers: dict[str, threading.Thread] = {}
+stream_workers_lock = threading.Lock()
 
 DEFAULT_CONFIG = {
     "server_name": "CamHub-RPI4",
@@ -187,6 +192,94 @@ def get_node(camera_id: str) -> dict[str, Any] | None:
         return None
 
 
+def set_live_frame(camera_id: str, frame: bytes) -> None:
+    now_mono = time.monotonic()
+    with frame_lock:
+        previous = frame_cache.get(camera_id, {})
+        previous_at = float(previous.get("received_mono") or 0.0)
+        previous_fps = float(previous.get("source_fps") or 0.0)
+        instant_fps = 0.0
+        if previous_at > 0 and now_mono > previous_at:
+            instant_fps = 1.0 / (now_mono - previous_at)
+        source_fps = instant_fps if previous_fps <= 0 else (previous_fps * 0.8 + instant_fps * 0.2)
+        frame_cache[camera_id] = {
+            "frame": frame,
+            "seq": int(previous.get("seq") or 0) + 1,
+            "received_mono": now_mono,
+            "received_at": time.time(),
+            "source_fps": min(source_fps, 60.0),
+        }
+
+
+def get_live_frame(camera_id: str, max_age: float = 10.0) -> dict[str, Any] | None:
+    with frame_lock:
+        item = frame_cache.get(camera_id)
+        if not item:
+            return None
+        if time.monotonic() - float(item.get("received_mono") or 0.0) > max_age:
+            return None
+        return dict(item)
+
+
+def camera_stream_worker(camera_id: str) -> None:
+    while True:
+        node = get_node(camera_id)
+        stream_url = str((node or {}).get("stream_url") or "")
+        if not stream_url:
+            time.sleep(1.0)
+            continue
+
+        try:
+            request = urllib.request.Request(
+                stream_url,
+                headers={"User-Agent": "CamHub/0.5", "Connection": "keep-alive"},
+            )
+            with urllib.request.urlopen(request, timeout=12) as response:
+                buffer = b""
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    buffer += chunk
+
+                    while True:
+                        start = buffer.find(b"\xff\xd8")
+                        if start < 0:
+                            if len(buffer) > 2:
+                                buffer = buffer[-2:]
+                            break
+
+                        end = buffer.find(b"\xff\xd9", start + 2)
+                        if end < 0:
+                            if start > 0:
+                                buffer = buffer[start:]
+                            if len(buffer) > 8 * 1024 * 1024:
+                                buffer = b""
+                            break
+
+                        frame = buffer[start:end + 2]
+                        buffer = buffer[end + 2:]
+                        if len(frame) > 1024:
+                            set_live_frame(camera_id, frame)
+        except Exception:
+            time.sleep(1.0)
+
+
+def ensure_stream_worker(camera_id: str) -> None:
+    with stream_workers_lock:
+        worker = stream_workers.get(camera_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(
+            target=camera_stream_worker,
+            args=(camera_id,),
+            daemon=True,
+            name=f"camhub-stream-{camera_id}",
+        )
+        stream_workers[camera_id] = worker
+        worker.start()
+
+
 def media_files() -> list[Path]:
     return [p for p in DATA_DIR.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
 
@@ -339,7 +432,8 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label>Intervallo foto, secondi<input id="snapshot_interval_sec" type="number"></label>
 <label>Risoluzione<select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select></label>
 <label>Qualità JPEG, 4 migliore - 30 più compressa<input id="jpeg_quality" type="number" min="4" max="30"></label>
-<label>FPS massimo live<input id="stream_max_fps" type="number" min="1" max="10"></label>
+<label>FPS live/video (1-15)<input id="stream_max_fps" type="number" min="1" max="15"></label>
+<div class="muted">Il video usa sempre la risoluzione selezionata sopra. Non viene abbassata durante la registrazione.</div>
 <label>Luminosità (-2..2)<input id="brightness" type="number" min="-2" max="2"></label>
 <label>Contrasto (-2..2)<input id="contrast" type="number" min="-2" max="2"></label>
 <label>Saturazione (-2..2)<input id="saturation" type="number" min="-2" max="2"></label>
@@ -365,12 +459,12 @@ async function refresh(){
  for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
  document.getElementById('recordButton').textContent='Registra '+(cfg.event_video_sec||10)+' secondi';
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
- if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'');if(n.stream_url&&n.stream_url!==currentStream){currentStream=n.stream_url;document.getElementById('live').src=currentStream+'?t='+Date.now()}}
+ if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')+' · sorgente '+(n.ingest_fps||0)+' fps';const proxy='/api/camera/'+n.camera_id+'/live';if(proxy!==currentStream){currentStream=proxy;document.getElementById('live').src=proxy+'?t='+Date.now()}}
  const items=await fetch('/api/recent?limit=80').then(r=>r.json());document.getElementById('events').innerHTML=items.map(x=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+x.cloud_status+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
 }
 async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
 async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore: '+await r.text();setTimeout(refresh,1000)}
-async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;const live=document.getElementById('live');const previous=live.src;live.src='';currentStream='';e.textContent='Registrazione '+d+' secondi in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi, '+j.fps+' fps.'}else{e.textContent='Errore: '+await r.text()}setTimeout(refresh,800)}
+async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore: '+await r.text()}setTimeout(refresh,800)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});document.getElementById('actionResult').textContent=r.ok?'Sincronizzazione avviata.':'Errore cloud';setTimeout(refresh,3000)}
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
 refresh();setInterval(refresh,10000);
@@ -399,8 +493,8 @@ def set_config(cfg: ConfigModel):
         raise HTTPException(400, "Unsupported camera_frame_size")
     if not 4 <= data["jpeg_quality"] <= 30:
         raise HTTPException(400, "jpeg_quality must be 4..30")
-    if not 1 <= data["stream_max_fps"] <= 10:
-        raise HTTPException(400, "stream_max_fps must be 1..10")
+    if not 1 <= data["stream_max_fps"] <= 15:
+        raise HTTPException(400, "stream_max_fps must be 1..15")
     for name in ("brightness", "contrast", "saturation"):
         if not -2 <= data[name] <= 2:
             raise HTTPException(400, f"{name} must be -2..2")
@@ -452,6 +546,7 @@ async def node_heartbeat(request: Request, x_cam_token: str | None = Header(defa
     payload["last_seen"] = now_local().isoformat()
     payload["observed_ip"] = request.client.host if request.client else None
     save_node(camera_id, payload)
+    ensure_stream_worker(camera_id)
     return {"ok": True}
 
 
@@ -464,6 +559,8 @@ def api_nodes():
             node = json.loads(path.read_text(encoding="utf-8"))
             seen = datetime.fromisoformat(node["last_seen"])
             node["online"] = (now - seen).total_seconds() < 45
+            cached = get_live_frame(str(node.get("camera_id") or ""), max_age=5.0)
+            node["ingest_fps"] = round(float((cached or {}).get("source_fps") or 0.0), 1)
             nodes.append(node)
         except Exception:
             continue
@@ -554,19 +651,27 @@ def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]
 
 @app.post("/api/camera/{camera_id}/capture")
 def manual_capture(camera_id: str):
-    url = _node_url(camera_id, "capture_url", "/capture")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "CamHub/0.4"})
-        with urllib.request.urlopen(req, timeout=20) as response:
-            payload = response.read(8 * 1024 * 1024)
-            if not payload:
-                raise HTTPException(502, "Camera returned an empty image")
-    except urllib.error.URLError as exc:
-        raise HTTPException(502, f"Camera capture failed: {exc}") from exc
+    ensure_stream_worker(camera_id)
+
+    cached = get_live_frame(camera_id, max_age=3.0)
+    payload = bytes(cached["frame"]) if cached else b""
+
+    if not payload:
+        url = _node_url(camera_id, "capture_url", "/capture")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "CamHub/0.5", "Connection": "close"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                payload = response.read(8 * 1024 * 1024)
+        except urllib.error.URLError as exc:
+            raise HTTPException(502, f"Camera capture failed: {exc}") from exc
+
+    if not payload:
+        raise HTTPException(502, "Camera returned an empty image")
+
     dt = now_local()
     out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, "manual", dt, ".jpg")
     out_path.write_bytes(payload)
-    meta = register_media(out_path, camera_id, "manual", dt, "node_capture")
+    meta = register_media(out_path, camera_id, "manual", dt, "live_frame")
     return {"ok": True, "file": out_path.name, "sha256": meta["sha256"]}
 
 
@@ -574,77 +679,111 @@ def manual_capture(camera_id: str):
 def record_video(camera_id: str, duration: int | None = None):
     cfg = load_config()
     seconds = max(1, min(int(duration or cfg["event_video_sec"]), 60))
-    capture_url = _node_url(camera_id, "capture_url", "/capture")
+    requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
 
     if shutil.which("ffmpeg") is None:
         raise HTTPException(500, "ffmpeg is not installed")
 
-    requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 5))
+    ensure_stream_worker(camera_id)
+
+    wait_deadline = time.monotonic() + 8.0
+    while get_live_frame(camera_id, max_age=3.0) is None and time.monotonic() < wait_deadline:
+        time.sleep(0.1)
+
+    if get_live_frame(camera_id, max_age=3.0) is None:
+        raise HTTPException(502, "Live camera stream is not available")
+
     dt = now_local()
     out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, f"video_{seconds}s", dt, ".mp4")
+    total_frames = seconds * requested_fps
+    unique_sequences: set[int] = set()
 
-    captured = 0
-    started = time.monotonic()
-    deadline = started + seconds
+    with tempfile.TemporaryDirectory(prefix="camhub-video-") as tmp:
+        temp_dir = Path(tmp)
+        started = time.monotonic()
 
-    try:
-        with tempfile.TemporaryDirectory(prefix="camhub-video-") as tmp:
-            temp_dir = Path(tmp)
-            frame_index = 0
+        for frame_index in range(1, total_frames + 1):
+            target = started + ((frame_index - 1) / float(requested_fps))
+            now_mono = time.monotonic()
+            if now_mono < target:
+                time.sleep(target - now_mono)
 
-            while time.monotonic() < deadline:
-                frame_started = time.monotonic()
-                try:
-                    req = urllib.request.Request(
-                        capture_url + f"?t={int(time.time() * 1000)}",
-                        headers={"User-Agent": "CamHub/0.4.1", "Connection": "close"},
-                    )
-                    with urllib.request.urlopen(req, timeout=5) as response:
-                        payload = response.read(8 * 1024 * 1024)
-                    if payload:
-                        frame_index += 1
-                        (temp_dir / f"frame_{frame_index:06d}.jpg").write_bytes(payload)
-                        captured += 1
-                except Exception:
-                    pass
+            cached = get_live_frame(camera_id, max_age=3.0)
+            if cached is None:
+                out_path.unlink(missing_ok=True)
+                raise HTTPException(502, "Camera stream interrupted during recording")
 
-                target_delay = 1.0 / requested_fps
-                elapsed = time.monotonic() - frame_started
-                if elapsed < target_delay:
-                    time.sleep(target_delay - elapsed)
+            payload = bytes(cached["frame"])
+            unique_sequences.add(int(cached.get("seq") or 0))
+            (temp_dir / f"frame_{frame_index:06d}.jpg").write_bytes(payload)
 
-            if captured < 2:
-                raise HTTPException(502, "Not enough frames received from camera")
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-framerate", str(requested_fps),
+            "-i", str(temp_dir / "frame_%06d.jpg"),
+            "-an", "-c:v", "libx264", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(out_path),
+        ]
 
-            output_fps = max(1.0, captured / float(seconds))
-            command = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-framerate", f"{output_fps:.3f}",
-                "-i", str(temp_dir / "frame_%06d.jpg"),
-                "-an", "-c:v", "libx264", "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                str(out_path),
-            ]
-
-            result = subprocess.run(command, capture_output=True, text=True, timeout=45)
-
-    except subprocess.TimeoutExpired as exc:
-        out_path.unlink(missing_ok=True)
-        raise HTTPException(504, "Video encoding timed out") from exc
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            out_path.unlink(missing_ok=True)
+            raise HTTPException(504, "Video encoding timed out") from exc
 
     if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
         out_path.unlink(missing_ok=True)
         raise HTTPException(502, "ffmpeg encoding failed: " + (result.stderr or result.stdout)[-1200:])
 
-    meta = register_media(out_path, camera_id, f"video_{seconds}s", dt, "snapshot_sequence")
+    meta = register_media(out_path, camera_id, f"video_{seconds}s", dt, "shared_live_stream")
     return {
         "ok": True,
         "file": out_path.name,
         "duration": seconds,
-        "frames": captured,
-        "fps": round(output_fps, 2),
+        "frames": total_frames,
+        "fps": requested_fps,
+        "unique_source_frames": len(unique_sequences),
+        "resolution": cfg.get("camera_frame_size"),
         "sha256": meta["sha256"],
     }
+
+
+@app.get("/api/camera/{camera_id}/live")
+def live_proxy(camera_id: str):
+    ensure_stream_worker(camera_id)
+
+    def generate():
+        last_seq = -1
+        while True:
+            cfg = load_config()
+            fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
+            item = get_live_frame(camera_id, max_age=5.0)
+
+            if item is None:
+                time.sleep(0.1)
+                continue
+
+            seq = int(item.get("seq") or 0)
+            if seq == last_seq:
+                time.sleep(min(0.1, 1.0 / fps))
+                continue
+
+            last_seq = seq
+            frame = bytes(item["frame"])
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
+                + frame
+                + b"\r\n"
+            )
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @app.get("/api/recent")
