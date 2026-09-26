@@ -24,7 +24,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.4.0")
+app = FastAPI(title="CamHub", version="0.4.1")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -343,8 +343,9 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label>Luminosità (-2..2)<input id="brightness" type="number" min="-2" max="2"></label>
 <label>Contrasto (-2..2)<input id="contrast" type="number" min="-2" max="2"></label>
 <label>Saturazione (-2..2)<input id="saturation" type="number" min="-2" max="2"></label>
-<label><input id="horizontal_mirror" type="checkbox"> Immagine specchiata</label>
-<label><input id="vertical_flip" type="checkbox"> Immagine capovolta</label>
+<label><input id="horizontal_mirror" type="checkbox"> Inverti destra/sinistra</label>
+<label><input id="vertical_flip" type="checkbox"> Capovolgi alto/basso</label>
+<div class="muted">Le modifiche di orientamento vengono applicate subito alla camera quando premi Salva.</div>
 <label>Durata registrazione, secondi<input id="event_video_sec" type="number" min="1" max="60"></label>
 <label>Retention locale, giorni<input id="retention_days" type="number" min="1"></label>
 <label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
@@ -367,9 +368,9 @@ async function refresh(){
  if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'');if(n.stream_url&&n.stream_url!==currentStream){currentStream=n.stream_url;document.getElementById('live').src=currentStream+'?t='+Date.now()}}
  const items=await fetch('/api/recent?limit=80').then(r=>r.json());document.getElementById('events').innerHTML=items.map(x=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+x.cloud_status+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
 }
-async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});document.getElementById('saveResult').textContent=r.ok?'Salvato. La camera applica i parametri entro circa 30 secondi.':'Errore';setTimeout(refresh,1000)}
+async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
 async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore: '+await r.text();setTimeout(refresh,1000)}
-async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});e.textContent=r.ok?'Video registrato e archiviato.':'Errore: '+await r.text();setTimeout(refresh,1000)}
+async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;const live=document.getElementById('live');const previous=live.src;live.src='';currentStream='';e.textContent='Registrazione '+d+' secondi in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi, '+j.fps+' fps.'}else{e.textContent='Errore: '+await r.text()}setTimeout(refresh,800)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});document.getElementById('actionResult').textContent=r.ok?'Sincronizzazione avviata.':'Errore cloud';setTimeout(refresh,3000)}
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
 refresh();setInterval(refresh,10000);
@@ -406,7 +407,19 @@ def set_config(cfg: ConfigModel):
     save_config(data)
     if data.get("drive_enabled"):
         queue_cloud_sync()
-    return {"ok": True}
+
+    camera_applied = False
+    camera_message = "camera not yet online"
+    try:
+        camera_applied, camera_message = push_config_to_node(data["camera_id"], data)
+    except Exception as exc:
+        camera_message = str(exc)
+
+    return {
+        "ok": True,
+        "camera_applied": camera_applied,
+        "camera_message": camera_message,
+    }
 
 
 @app.get("/api/node/config/{camera_id}")
@@ -517,6 +530,28 @@ def _node_url(camera_id: str, field: str, fallback_path: str) -> str:
     return str(url)
 
 
+def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]:
+    try:
+        base = _node_url(camera_id, "control_url", "/control")
+        query = (
+            f"?mirror={1 if cfg['horizontal_mirror'] else 0}"
+            f"&flip={1 if cfg['vertical_flip'] else 0}"
+            f"&frame={cfg['camera_frame_size']}"
+            f"&quality={cfg['jpeg_quality']}"
+            f"&brightness={cfg['brightness']}"
+            f"&contrast={cfg['contrast']}"
+            f"&saturation={cfg['saturation']}"
+            f"&fps={cfg['stream_max_fps']}"
+            f"&interval={cfg['snapshot_interval_sec']}"
+        )
+        req = urllib.request.Request(base + query, headers={"User-Agent": "CamHub/0.4.1"})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read(4096).decode("utf-8", errors="replace")
+        return True, body
+    except Exception as exc:
+        return False, str(exc)
+
+
 @app.post("/api/camera/{camera_id}/capture")
 def manual_capture(camera_id: str):
     url = _node_url(camera_id, "capture_url", "/capture")
@@ -538,29 +573,78 @@ def manual_capture(camera_id: str):
 @app.post("/api/camera/{camera_id}/record")
 def record_video(camera_id: str, duration: int | None = None):
     cfg = load_config()
-    seconds = int(duration or cfg["event_video_sec"])
-    seconds = max(1, min(seconds, 60))
-    stream_url = _node_url(camera_id, "stream_url", "/stream")
+    seconds = max(1, min(int(duration or cfg["event_video_sec"]), 60))
+    capture_url = _node_url(camera_id, "capture_url", "/capture")
+
     if shutil.which("ffmpeg") is None:
         raise HTTPException(500, "ffmpeg is not installed")
+
+    requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 5))
     dt = now_local()
     out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, f"video_{seconds}s", dt, ".mp4")
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", stream_url, "-t", str(seconds), "-an",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", str(out_path),
-    ]
+
+    captured = 0
+    started = time.monotonic()
+    deadline = started + seconds
+
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=seconds + 35)
+        with tempfile.TemporaryDirectory(prefix="camhub-video-") as tmp:
+            temp_dir = Path(tmp)
+            frame_index = 0
+
+            while time.monotonic() < deadline:
+                frame_started = time.monotonic()
+                try:
+                    req = urllib.request.Request(
+                        capture_url + f"?t={int(time.time() * 1000)}",
+                        headers={"User-Agent": "CamHub/0.4.1", "Connection": "close"},
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        payload = response.read(8 * 1024 * 1024)
+                    if payload:
+                        frame_index += 1
+                        (temp_dir / f"frame_{frame_index:06d}.jpg").write_bytes(payload)
+                        captured += 1
+                except Exception:
+                    pass
+
+                target_delay = 1.0 / requested_fps
+                elapsed = time.monotonic() - frame_started
+                if elapsed < target_delay:
+                    time.sleep(target_delay - elapsed)
+
+            if captured < 2:
+                raise HTTPException(502, "Not enough frames received from camera")
+
+            output_fps = max(1.0, captured / float(seconds))
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-framerate", f"{output_fps:.3f}",
+                "-i", str(temp_dir / "frame_%06d.jpg"),
+                "-an", "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                str(out_path),
+            ]
+
+            result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+
     except subprocess.TimeoutExpired as exc:
         out_path.unlink(missing_ok=True)
-        raise HTTPException(504, "Video recording timed out") from exc
+        raise HTTPException(504, "Video encoding timed out") from exc
+
     if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
         out_path.unlink(missing_ok=True)
-        raise HTTPException(502, "ffmpeg recording failed: " + (result.stderr or result.stdout)[-1200:])
-    meta = register_media(out_path, camera_id, f"video_{seconds}s", dt, "mjpeg_stream")
-    return {"ok": True, "file": out_path.name, "duration": seconds, "sha256": meta["sha256"]}
+        raise HTTPException(502, "ffmpeg encoding failed: " + (result.stderr or result.stdout)[-1200:])
+
+    meta = register_media(out_path, camera_id, f"video_{seconds}s", dt, "snapshot_sequence")
+    return {
+        "ok": True,
+        "file": out_path.name,
+        "duration": seconds,
+        "frames": captured,
+        "fps": round(output_fps, 2),
+        "sha256": meta["sha256"],
+    }
 
 
 @app.get("/api/recent")
