@@ -1235,19 +1235,26 @@ DASHBOARD = r"""
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CamHub</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}header{padding:16px 22px;background:#171a20;border-bottom:1px solid #30343b}main{padding:18px;max-width:1400px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.card{background:#171a20;border:1px solid #30343b;border-radius:12px;padding:15px}h1,h2{margin-top:0}img.live,img.latest{width:100%;min-height:220px;max-height:520px;object-fit:contain;background:#000;border-radius:8px}label{display:block;margin-top:8px;font-size:13px;color:#bbb}input,select{width:100%;box-sizing:border-box;padding:8px;margin-top:4px;background:#0d0f13;color:#eee;border:1px solid #444;border-radius:6px}input[type=checkbox]{width:auto}button{padding:10px 13px;margin:6px 5px 0 0;border:0;border-radius:7px;cursor:pointer}.ok{color:#7df07d}.bad{color:#ff7b7b}.muted{color:#999}.actions{margin-top:10px}table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:7px;border-bottom:1px solid #30343b;text-align:left}a{color:#8cc8ff}.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}header{padding:16px 22px;background:#171a20;border-bottom:1px solid #30343b}main{padding:18px;max-width:1400px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.card{background:#171a20;border:1px solid #30343b;border-radius:12px;padding:15px}h1,h2{margin-top:0}img.live,img.latest{width:100%;min-height:220px;max-height:520px;object-fit:contain;background:#000;border-radius:8px}label{display:block;margin-top:8px;font-size:13px;color:#bbb}input,select{width:100%;box-sizing:border-box;padding:8px;margin-top:4px;background:#0d0f13;color:#eee;border:1px solid #444;border-radius:6px}input[type=checkbox]{width:auto}button{padding:10px 13px;margin:6px 5px 0 0;border:0;border-radius:7px;cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}.ok{color:#7df07d}.bad{color:#ff7b7b}.muted{color:#999}.actions{margin-top:10px}table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:7px;border-bottom:1px solid #30343b;text-align:left}a{color:#8cc8ff}.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
 </style></head>
 <body><header><h1>CamHub</h1><div class="muted">ESP32-CAM + Raspberry Pi · <a href="/debug">Debug / Errori</a></div></header><main>
 <div class="grid">
-<div class="card"><h2>Live</h2><img id="live" class="live" alt="Live non disponibile"><div id="nodeInfo" class="muted"></div><div class="actions"><button onclick="manualCapture()">Scatta ora</button><button id="recordButton" onclick="recordVideo()">Registra video</button></div><div id="actionResult"></div></div>
+<div class="card"><h2>Controllo camera</h2>
+<div id="modeInfo"></div>
+<div class="actions"><button id="autoModeButton" onclick="setMode('automatic')">Automatico</button><button id="manualModeButton" onclick="setMode('manual')">Manuale</button></div>
+<div class="muted" style="margin-top:8px">Automatico: una foto all'intervallo configurato. Manuale: l'automatico si ferma e Foto/Video vengono eseguiti uno alla volta in coda.</div>
+<div id="nodeInfo" class="muted" style="margin-top:10px"></div>
+<div id="queueInfo" class="muted" style="margin-top:10px"></div>
+<div class="actions"><button id="photoButton" onclick="manualCapture()">Foto</button><button id="recordButton" onclick="recordVideo()">Registra video</button></div>
+<div id="actionResult"></div></div>
 <div class="card"><h2>Ultima foto archiviata</h2><img id="latest" class="latest"><div id="latestInfo" class="muted"></div></div>
 <div class="card"><h2>Stato server</h2><div id="status">Caricamento...</div><div class="actions"><button onclick="syncPending()">Sincronizza cloud</button><button onclick="cleanupOld()">Pulizia retention</button></div></div>
 <div class="card"><h2>Configurazione camera</h2>
-<label>Intervallo foto, secondi<input id="snapshot_interval_sec" type="number"></label>
+<label>Intervallo automatico foto, secondi<input id="snapshot_interval_sec" type="number"></label>
 <label>Risoluzione<select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select></label>
 <label>Qualità JPEG, 4 migliore - 30 più compressa<input id="jpeg_quality" type="number" min="4" max="30"></label>
-<label>FPS live/video (1-15)<input id="stream_max_fps" type="number" min="1" max="15"></label>
-<div class="muted">Il video usa sempre la risoluzione selezionata sopra. Non viene abbassata durante la registrazione.</div>
+<label>FPS video richiesti (1-15)<input id="stream_max_fps" type="number" min="1" max="15"></label>
+<div class="muted">Il flusso video viene aperto solo durante una registrazione. Non esiste più uno streaming continuo che compete con foto o video.</div>
 <label>Luminosità (-2..2)<input id="brightness" type="number" min="-2" max="2"></label>
 <label>Contrasto (-2..2)<input id="contrast" type="number" min="-2" max="2"></label>
 <label>Saturazione (-2..2)<input id="saturation" type="number" min="-2" max="2"></label>
@@ -1270,7 +1277,7 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <div class="card" style="margin-top:14px"><h2>Ultime acquisizioni</h2><table><thead><tr><th>Ora</th><th>Tipo</th><th>Evento</th><th>File</th><th>Dimensione</th><th>Cloud</th><th>SHA-256</th></tr></thead><tbody id="events"></tbody></table></div>
 </main>
 <script>
-let cfg={};let currentStream='';let recentMedia=[];
+let cfg={};let recentMedia=[];
 function fmtBytes(n){if(!n)return '0';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return (n/1024).toFixed(1)+' KB'}
 async function refresh(){
  const st=await fetch('/api/status').then(r=>r.json());
@@ -1281,17 +1288,26 @@ async function refresh(){
  cfg=await fetch('/api/config').then(r=>r.json());
  for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit','google_oauth_client_id']) document.getElementById(k).value=cfg[k]??'';
  for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
- document.getElementById('recordButton').textContent='Registra '+(cfg.event_video_sec||10)+' secondi';
+ document.getElementById('recordButton').textContent='Video '+(cfg.event_video_sec||10)+' secondi';
+ const manual=cfg.camera_mode==='manual';
+ document.getElementById('photoButton').disabled=!manual;
+ document.getElementById('recordButton').disabled=!manual;
+ document.getElementById('modeInfo').innerHTML=manual?'<span class="ok"><b>MODALITÀ MANUALE</b></span> · automatico fermo':'<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · foto ogni '+cfg.snapshot_interval_sec+' secondi';
+ const q=st.camera_queue||{};
+ const active=q.active?('#'+q.active.id+' '+q.active.kind+' in esecuzione'):'nessuna operazione in esecuzione';
+ const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
+ document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · attesa '+(q.queue_length||0)+(queued?'<br>'+queued:'')+(!manual&&q.next_automatic_in_sec!==undefined?'<br>Prossima foto automatica tra '+q.next_automatic_in_sec+' s':'');
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
- if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')+' · sorgente '+(n.ingest_fps||0)+' fps';const proxy='/api/camera/'+n.camera_id+'/live';if(proxy!==currentStream){currentStream=proxy;document.getElementById('live').src=proxy+'?t='+Date.now()}}
+ if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')}
  recentMedia=await fetch('/api/recent?limit=80').then(r=>r.json());
  document.getElementById('events').innerHTML=recentMedia.map((x,i)=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+(x.cloud_status==='ERROR'?'<button onclick="showMediaError('+i+')">ERROR - dettagli</button>':x.cloud_status)+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
 }
 function showMediaError(i){window.location.href='/debug'}
 async function apiErrorText(r){try{const j=await r.json();return j.detail||j.error||JSON.stringify(j)}catch(e){try{return await r.text()}catch(e2){return 'Errore HTTP '+r.status}}}
-async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.google_oauth_client_id=document.getElementById('google_oauth_client_id').value.trim();c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
-async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore scatto: '+await apiErrorText(r);setTimeout(refresh,1000)}
-async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,800)}
+async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.google_oauth_client_id=document.getElementById('google_oauth_client_id').value.trim();c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';setTimeout(refresh,800)}
+async function setMode(mode){const e=document.getElementById('actionResult');e.textContent=mode==='manual'?'Arresto automatico e passo in manuale...':'Attivo acquisizione automatica...';const r=await fetch('/api/camera/mode/'+mode,{method:'POST'});if(r.ok){e.textContent=mode==='manual'?'Modalità MANUALE attiva. Foto e video verranno messi in coda.':'Modalità AUTOMATICA attiva.'}else{e.textContent='Errore cambio modalità: '+await apiErrorText(r)}setTimeout(refresh,300)}
+async function manualCapture(){const e=document.getElementById('actionResult');const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Foto #'+j.operation.id+' aggiunta in coda, posizione '+j.operation.position+'.'}else{e.textContent='Errore foto: '+await apiErrorText(r)}setTimeout(refresh,250)}
+async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video #'+j.operation.id+' ('+d+' s) aggiunto in coda, posizione '+j.operation.position+'.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,250)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent=j.paused?'Google Drive è temporaneamente in pausa per rate limit. Riprova tra '+j.remaining_sec+' secondi.':(r.ok?'Sincronizzazione avviata.':'Errore cloud');setTimeout(refresh,1500)}
 async function testDrive(){const e=document.getElementById('actionResult');e.textContent='Test Google Drive in corso...';const r=await fetch('/api/cloud/test',{method:'POST'});const j=await r.json();e.textContent=(j.ok?'Google Drive OK. ':'Google Drive ERRORE. ')+(j.custom_oauth?'OAuth dedicato configurato. ':'OAuth dedicato NON configurato. ')+(j.detail||'');setTimeout(refresh,1000)}
 let googlePoll=null;
