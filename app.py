@@ -27,7 +27,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.7.0")
+app = FastAPI(title="CamHub", version="0.8.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -454,45 +454,65 @@ def enqueue_camera_operation(
 
 def _direct_camera_photo(camera_id: str, event_type: str) -> dict[str, Any]:
     url = _node_url(camera_id, "capture_url", "/capture")
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "CamHub/0.7", "Connection": "close"},
-    )
+    last_error = ""
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            payload = response.read(8 * 1024 * 1024)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Camera photo HTTP {exc.code}: {detail or exc.reason}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Camera photo connection failed: {exc}") from exc
+    for attempt in range(1, 4):
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "CamHub/0.8", "Connection": "close"},
+        )
 
-    if not payload:
-        raise RuntimeError("Camera returned an empty JPEG")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                payload = response.read(8 * 1024 * 1024)
 
-    dt = now_local()
-    out_path = camera_day_dir(camera_id, dt) / make_filename(
-        camera_id,
-        event_type,
-        dt,
-        ".jpg",
+            if not payload:
+                raise RuntimeError("Camera returned an empty JPEG")
+
+            dt = now_local()
+            out_path = camera_day_dir(camera_id, dt) / make_filename(
+                camera_id,
+                event_type,
+                dt,
+                ".jpg",
+            )
+            out_path.write_bytes(payload)
+            meta = register_media(
+                out_path,
+                camera_id,
+                event_type,
+                dt,
+                "exclusive_direct_capture",
+            )
+            return {
+                "file": out_path.name,
+                "sha256": meta["sha256"],
+                "size": len(payload),
+                "attempt": attempt,
+            }
+
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            last_error = f"HTTP {exc.code}: {detail or exc.reason}"
+
+            if exc.code not in (409, 423, 429, 503) or attempt >= 3:
+                break
+
+        except urllib.error.URLError as exc:
+            last_error = f"connection error: {exc}"
+            if attempt >= 3:
+                break
+
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= 3:
+                break
+
+        time.sleep(0.6 * attempt)
+
+    raise RuntimeError(
+        f"Exclusive photo failed after 3 attempts: {last_error}"
     )
-    out_path.write_bytes(payload)
-    meta = register_media(
-        out_path,
-        camera_id,
-        event_type,
-        dt,
-        "exclusive_direct_capture",
-    )
-    return {
-        "file": out_path.name,
-        "sha256": meta["sha256"],
-        "size": len(payload),
-    }
 
 
 def _exclusive_camera_video(camera_id: str, seconds: int) -> dict[str, Any]:
@@ -510,99 +530,57 @@ def _exclusive_camera_video(camera_id: str, seconds: int) -> dict[str, Any]:
         ".mp4",
     )
 
-    with tempfile.TemporaryDirectory(prefix="camhub-exclusive-video-") as tmp:
-        temp_dir = Path(tmp)
-        frame_count = 0
-        started = time.monotonic()
-        buffer = b""
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-use_wallclock_as_timestamps", "1",
+        "-i", stream_url,
+        "-t", str(seconds),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-r", str(requested_fps),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
 
-        request = urllib.request.Request(
-            stream_url,
-            headers={"User-Agent": "CamHub/0.7", "Connection": "close"},
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                while time.monotonic() - started < seconds:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    buffer += chunk
-
-                    while True:
-                        start = buffer.find(b"\xff\xd8")
-                        if start < 0:
-                            if len(buffer) > 2:
-                                buffer = buffer[-2:]
-                            break
-
-                        end = buffer.find(b"\xff\xd9", start + 2)
-                        if end < 0:
-                            if start > 0:
-                                buffer = buffer[start:]
-                            if len(buffer) > 8 * 1024 * 1024:
-                                buffer = b""
-                            break
-
-                        frame = buffer[start:end + 2]
-                        buffer = buffer[end + 2:]
-                        if len(frame) > 1024:
-                            frame_count += 1
-                            (temp_dir / f"frame_{frame_count:06d}.jpg").write_bytes(frame)
-
-                        if time.monotonic() - started >= seconds:
-                            break
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"Camera video stream HTTP {exc.code}: {detail or exc.reason}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Camera video stream connection failed: {exc}") from exc
-
-        elapsed = max(0.1, time.monotonic() - started)
-        if frame_count < 2:
-            raise RuntimeError(
-                f"Video stream produced only {frame_count} usable frame(s)"
-            )
-
-        source_fps = max(0.1, min(30.0, frame_count / elapsed))
-        command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-framerate", f"{source_fps:.3f}",
-            "-i", str(temp_dir / "frame_%06d.jpg"),
-            "-an", "-c:v", "libx264", "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(out_path),
-        ]
-
+    try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=max(60, seconds + 45),
+            timeout=max(45, seconds + 35),
         )
-
-    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+    except subprocess.TimeoutExpired as exc:
         out_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            "ffmpeg encoding failed: " + (result.stderr or result.stdout)[-1200:]
-        )
+        raise RuntimeError("Video recording timed out") from exc
+
+    if (
+        result.returncode != 0
+        or not out_path.exists()
+        or out_path.stat().st_size == 0
+    ):
+        out_path.unlink(missing_ok=True)
+        detail = (result.stderr or result.stdout or "unknown ffmpeg error")[-2000:]
+        raise RuntimeError("Video recording failed: " + detail)
 
     meta = register_media(
         out_path,
         camera_id,
         f"video_{seconds}s",
         dt,
-        "exclusive_mjpeg_stream",
+        "exclusive_mjpeg_ffmpeg",
     )
+
     return {
         "file": out_path.name,
         "duration": seconds,
-        "frames": frame_count,
-        "source_fps": round(source_fps, 2),
         "requested_fps": requested_fps,
         "resolution": cfg.get("camera_frame_size"),
+        "size": out_path.stat().st_size,
         "sha256": meta["sha256"],
     }
 
@@ -663,6 +641,10 @@ def camera_operation_worker() -> None:
                     del camera_operation_history[25:]
                     camera_operation_active = None
 
+                # Let the ESP32 camera/HTTP stack settle before the next
+                # serialized operation. No camera operation overlaps another.
+                time.sleep(0.75)
+
 
 def ensure_camera_operation_worker() -> None:
     global camera_operation_worker_started
@@ -706,15 +688,12 @@ def automatic_snapshot_scheduler() -> None:
 
             if now_mono >= automatic_next_due:
                 with camera_operation_lock:
-                    periodic_pending = (
-                        camera_operation_active is not None
-                        and camera_operation_active.get("origin") == "automatic"
-                    ) or any(
-                        item.get("origin") == "automatic"
-                        for item in camera_operation_queue
+                    camera_idle = (
+                        camera_operation_active is None
+                        and not camera_operation_queue
                     )
 
-                if not periodic_pending:
+                if camera_idle:
                     enqueue_camera_operation(
                         "photo",
                         camera_id,
