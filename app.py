@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 import threading
-from datetime import datetime
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +20,15 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DATA_DIR = BASE_DIR / "data"
+NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
+NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub V1", version="0.2.0")
+app = FastAPI(title="CamHub", version="0.4.0")
 config_lock = threading.RLock()
+cloud_lock = threading.Lock()
+cloud_event = threading.Event()
+cloud_worker_started = False
 
 DEFAULT_CONFIG = {
     "server_name": "CamHub-RPI4",
@@ -26,27 +36,46 @@ DEFAULT_CONFIG = {
     "camera_name": "Camera 1",
     "upload_token": "change-me-now",
     "snapshot_interval_sec": 60,
-    "event_video_sec": 30,
+    "event_video_sec": 10,
     "motion_enabled": False,
     "drive_enabled": False,
     "drive_remote": "gdrive",
     "drive_root": "CamHub",
     "retention_days": 7,
+    "camera_frame_size": "SXGA",
+    "jpeg_quality": 8,
+    "horizontal_mirror": False,
+    "vertical_flip": False,
+    "brightness": 0,
+    "contrast": 0,
+    "saturation": 0,
+    "stream_max_fps": 5,
 }
+
+FRAME_SIZES = {"VGA", "SVGA", "XGA", "HD", "SXGA", "UXGA"}
+MEDIA_SUFFIXES = {".jpg", ".jpeg", ".mp4"}
 
 
 class ConfigModel(BaseModel):
-    server_name: str
-    camera_id: str
-    camera_name: str
-    upload_token: str
+    server_name: str = "CamHub-RPI4"
+    camera_id: str = "CAM01"
+    camera_name: str = "Camera 1"
+    upload_token: str = "change-me-now"
     snapshot_interval_sec: int = 60
-    event_video_sec: int = 30
+    event_video_sec: int = 10
     motion_enabled: bool = False
     drive_enabled: bool = False
     drive_remote: str = "gdrive"
     drive_root: str = "CamHub"
     retention_days: int = 7
+    camera_frame_size: str = "SXGA"
+    jpeg_quality: int = 8
+    horizontal_mirror: bool = False
+    vertical_flip: bool = False
+    brightness: int = 0
+    contrast: int = 0
+    saturation: int = 0
+    stream_max_fps: int = 5
 
 
 def save_config(cfg: dict[str, Any]) -> None:
@@ -58,9 +87,16 @@ def save_config(cfg: dict[str, Any]) -> None:
 
 def load_config() -> dict[str, Any]:
     with config_lock:
-        if not CONFIG_PATH.exists():
-            save_config(DEFAULT_CONFIG)
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        existing: dict[str, Any] = {}
+        if CONFIG_PATH.exists():
+            try:
+                existing = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        merged = {**DEFAULT_CONFIG, **existing}
+        if merged != existing:
+            save_config(merged)
+        return merged
 
 
 def now_local() -> datetime:
@@ -73,233 +109,268 @@ def camera_day_dir(camera_id: str, dt: datetime) -> Path:
     return path
 
 
-def metadata_path(image_path: Path) -> Path:
-    return image_path.with_suffix(".json")
+def metadata_path(media_path: Path) -> Path:
+    return media_path.with_suffix(".json")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_metadata(path: Path, data: dict[str, Any]) -> None:
     metadata_path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def read_metadata(path: Path) -> dict[str, Any]:
+    meta = metadata_path(path)
+    if not meta.exists():
+        return {}
+    try:
+        return json.loads(meta.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def update_metadata(path: Path, **updates: Any) -> None:
-    meta_path = metadata_path(path)
-    data: dict[str, Any] = {}
-    if meta_path.exists():
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    data = read_metadata(path)
     data.update(updates)
     write_metadata(path, data)
 
 
-def cloud_target_for(path: Path, cfg: dict[str, Any]) -> str:
-    relative = path.relative_to(DATA_DIR)
-    parent = relative.parent.as_posix()
-    return f"{cfg['drive_remote']}:{cfg['drive_root'].strip('/')}/{parent}/{path.name}"
+def make_filename(camera: str, event_type: str, dt: datetime, suffix: str) -> str:
+    safe_event = "".join(char for char in event_type.upper() if char.isalnum() or char in "_-")[:24] or "MEDIA"
+    return f"{camera}_{safe_event}_{dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]}{suffix}"
 
 
-def upload_to_drive(path: Path) -> None:
+def register_media(path: Path, camera: str, event_type: str, captured_at: datetime, source: str) -> dict[str, Any]:
     cfg = load_config()
-    if not cfg.get("drive_enabled"):
-        update_metadata(path, cloud_status="DISABLED")
-        return
+    data = {
+        "camera_id": camera,
+        "event_type": event_type,
+        "captured_at": captured_at.isoformat(),
+        "received_at": now_local().isoformat(),
+        "filename": path.name,
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "source": source,
+        "media_type": "video" if path.suffix.lower() == ".mp4" else "image",
+        "cloud_status": "PENDING" if cfg.get("drive_enabled") else "DISABLED",
+    }
+    write_metadata(path, data)
+    if cfg.get("drive_enabled"):
+        queue_cloud_sync()
+    return data
 
-    target = cloud_target_for(path, cfg)
-    update_metadata(path, cloud_status="UPLOADING", cloud_target=target)
 
+def node_path(camera_id: str) -> Path:
+    safe = "".join(c for c in camera_id if c.isalnum() or c in "_-")[:64]
+    return NODES_DIR / f"{safe}.json"
+
+
+def save_node(camera_id: str, data: dict[str, Any]) -> None:
+    node_path(camera_id).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def get_node(camera_id: str) -> dict[str, Any] | None:
+    path = node_path(camera_id)
+    if not path.exists():
+        return None
     try:
-        result = subprocess.run(
-            [
-                "rclone",
-                "copyto",
-                str(path),
-                target,
-                "--retries",
-                "3",
-                "--low-level-retries",
-                "5",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if result.returncode == 0:
-            update_metadata(
-                path,
-                cloud_status="SYNCED",
-                cloud_synced_at=now_local().isoformat(),
-                cloud_target=target,
-            )
-        else:
-            update_metadata(
-                path,
-                cloud_status="ERROR",
-                cloud_error=(result.stderr or result.stdout)[-2000:],
-                cloud_target=target,
-            )
-    except Exception as exc:
-        update_metadata(path, cloud_status="ERROR", cloud_error=str(exc), cloud_target=target)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def media_files() -> list[Path]:
+    return [p for p in DATA_DIR.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
 
 
 def latest_jpg(camera_id: str | None = None) -> Path | None:
     base = DATA_DIR / camera_id if camera_id else DATA_DIR
     if not base.exists():
         return None
-    files = list(base.rglob("*.jpg"))
+    files = [p for p in base.rglob("*.jpg") if p.is_file()]
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
-def recent_items(limit: int = 30) -> list[dict[str, Any]]:
-    jpgs = sorted(
-        DATA_DIR.rglob("*.jpg"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:limit]
-
+def recent_items(limit: int = 50) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for path in jpgs:
-        meta: dict[str, Any] = {}
-        meta_file = metadata_path(path)
-        if meta_file.exists():
-            try:
-                meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        items.append(
-            {
-                "file": path.name,
-                "relative": path.relative_to(DATA_DIR).as_posix(),
-                "camera_id": meta.get("camera_id"),
-                "event_type": meta.get("event_type"),
-                "captured_at": meta.get("captured_at"),
-                "cloud_status": meta.get("cloud_status", "PENDING"),
-                "size": path.stat().st_size,
-            }
-        )
+    files = sorted(media_files(), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    for path in files:
+        meta = read_metadata(path)
+        items.append({
+            "file": path.name,
+            "relative": path.relative_to(DATA_DIR).as_posix(),
+            "camera_id": meta.get("camera_id"),
+            "event_type": meta.get("event_type"),
+            "captured_at": meta.get("captured_at"),
+            "cloud_status": meta.get("cloud_status", "PENDING"),
+            "size": path.stat().st_size,
+            "sha256": meta.get("sha256"),
+            "media_type": meta.get("media_type", "video" if path.suffix.lower() == ".mp4" else "image"),
+        })
     return items
+
+
+def _rclone_batch(files: list[Path], cfg: dict[str, Any]) -> tuple[bool, str]:
+    if not files:
+        return True, ""
+    target = f"{cfg['drive_remote']}:{cfg['drive_root'].strip('/')}"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as temp:
+        temp_path = Path(temp.name)
+        for path in files:
+            temp.write(path.relative_to(DATA_DIR).as_posix() + "\n")
+    try:
+        result = subprocess.run(
+            [
+                "rclone", "copy", str(DATA_DIR), target,
+                "--files-from", str(temp_path),
+                "--transfers", "4", "--checkers", "4",
+                "--retries", "3", "--low-level-retries", "5",
+            ],
+            capture_output=True, text=True, timeout=900,
+        )
+        return result.returncode == 0, (result.stderr or result.stdout)[-3000:]
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def sync_pending_batch() -> int:
+    cfg = load_config()
+    if not cfg.get("drive_enabled"):
+        return 0
+    if shutil.which("rclone") is None:
+        return 0
+
+    with cloud_lock:
+        pending: list[Path] = []
+        for path in media_files():
+            status = read_metadata(path).get("cloud_status", "PENDING")
+            if status in ("PENDING", "ERROR"):
+                pending.append(path)
+
+        if not pending:
+            return 0
+
+        for path in pending:
+            update_metadata(path, cloud_status="UPLOADING")
+
+        first_batch: list[Path] = []
+        for path in pending:
+            first_batch.append(path)
+            meta = metadata_path(path)
+            if meta.exists():
+                first_batch.append(meta)
+
+        ok, error = _rclone_batch(first_batch, cfg)
+        if not ok:
+            for path in pending:
+                update_metadata(path, cloud_status="ERROR", cloud_error=error)
+            return 0
+
+        synced_at = now_local().isoformat()
+        meta_files: list[Path] = []
+        for path in pending:
+            update_metadata(path, cloud_status="SYNCED", cloud_synced_at=synced_at, cloud_error=None)
+            meta_files.append(metadata_path(path))
+
+        _rclone_batch(meta_files, cfg)
+        return len(pending)
+
+
+def cloud_worker() -> None:
+    while True:
+        cloud_event.wait()
+        cloud_event.clear()
+        time.sleep(2.0)
+        try:
+            sync_pending_batch()
+        except Exception:
+            pass
+
+
+def ensure_cloud_worker() -> None:
+    global cloud_worker_started
+    if cloud_worker_started:
+        return
+    cloud_worker_started = True
+    threading.Thread(target=cloud_worker, daemon=True, name="camhub-cloud").start()
+
+
+def queue_cloud_sync() -> None:
+    ensure_cloud_worker()
+    cloud_event.set()
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    load_config()
+    ensure_cloud_worker()
+    if load_config().get("drive_enabled"):
+        queue_cloud_sync()
 
 
 DASHBOARD = r"""
 <!doctype html>
 <html lang="it">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CamHub V1</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CamHub</title>
 <style>
-body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0}
-header{padding:18px 22px;background:#1b1b1b;border-bottom:1px solid #333}
-main{padding:20px;max-width:1200px;margin:auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
-.card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:16px}
-h1,h2{margin-top:0}
-img{width:100%;border-radius:8px;background:#000;min-height:180px;object-fit:contain}
-label{display:block;margin-top:8px;font-size:13px;color:#bbb}
-input{width:100%;box-sizing:border-box;padding:9px;margin-top:4px;background:#0d0d0d;color:#eee;border:1px solid #444;border-radius:6px}
-button{margin-top:12px;padding:10px 14px;border:0;border-radius:7px;cursor:pointer}
-.ok{color:#6f6}.bad{color:#f66}.muted{color:#999}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{padding:7px;border-bottom:1px solid #333;text-align:left}
-a{color:#8cc8ff}
-</style>
-</head>
-<body>
-<header><h1>CamHub V1</h1><div class="muted">Raspberry Pi camera acquisition server</div></header>
-<main>
+body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}header{padding:16px 22px;background:#171a20;border-bottom:1px solid #30343b}main{padding:18px;max-width:1400px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.card{background:#171a20;border:1px solid #30343b;border-radius:12px;padding:15px}h1,h2{margin-top:0}img.live,img.latest{width:100%;min-height:220px;max-height:520px;object-fit:contain;background:#000;border-radius:8px}label{display:block;margin-top:8px;font-size:13px;color:#bbb}input,select{width:100%;box-sizing:border-box;padding:8px;margin-top:4px;background:#0d0f13;color:#eee;border:1px solid #444;border-radius:6px}input[type=checkbox]{width:auto}button{padding:10px 13px;margin:6px 5px 0 0;border:0;border-radius:7px;cursor:pointer}.ok{color:#7df07d}.bad{color:#ff7b7b}.muted{color:#999}.actions{margin-top:10px}table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:7px;border-bottom:1px solid #30343b;text-align:left}a{color:#8cc8ff}.mono{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+</style></head>
+<body><header><h1>CamHub</h1><div class="muted">ESP32-CAM + Raspberry Pi</div></header><main>
 <div class="grid">
-  <div class="card">
-    <h2>Ultima immagine</h2>
-    <img id="latest" alt="Nessuna immagine">
-    <div id="latestInfo" class="muted"></div>
-  </div>
-  <div class="card">
-    <h2>Stato</h2>
-    <div id="status">Caricamento...</div>
-    <button onclick="syncPending()">Sincronizza file pendenti</button>
-  </div>
-  <div class="card">
-    <h2>Configurazione</h2>
-    <label>Camera ID<input id="camera_id"></label>
-    <label>Nome camera<input id="camera_name"></label>
-    <label>Token upload<input id="upload_token"></label>
-    <label>Snapshot ogni secondi<input id="snapshot_interval_sec" type="number"></label>
-    <label>Durata video evento futura, secondi<input id="event_video_sec" type="number"></label>
-    <label>Rclone remote<input id="drive_remote"></label>
-    <label>Cartella Drive<input id="drive_root"></label>
-    <label><input id="drive_enabled" type="checkbox" style="width:auto"> Google Drive attivo</label>
-    <button onclick="saveConfig()">Salva configurazione</button>
-    <div id="saveResult"></div>
-  </div>
+<div class="card"><h2>Live</h2><img id="live" class="live" alt="Live non disponibile"><div id="nodeInfo" class="muted"></div><div class="actions"><button onclick="manualCapture()">Scatta ora</button><button onclick="recordVideo()">Registra 10 secondi</button></div><div id="actionResult"></div></div>
+<div class="card"><h2>Ultima foto archiviata</h2><img id="latest" class="latest"><div id="latestInfo" class="muted"></div></div>
+<div class="card"><h2>Stato server</h2><div id="status">Caricamento...</div><div class="actions"><button onclick="syncPending()">Sincronizza cloud</button><button onclick="cleanupOld()">Pulizia retention</button></div></div>
+<div class="card"><h2>Configurazione camera</h2>
+<label>Intervallo foto, secondi<input id="snapshot_interval_sec" type="number"></label>
+<label>Risoluzione<select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select></label>
+<label>Qualità JPEG, 4 migliore - 30 più compressa<input id="jpeg_quality" type="number" min="4" max="30"></label>
+<label>FPS massimo live<input id="stream_max_fps" type="number" min="1" max="10"></label>
+<label>Luminosità (-2..2)<input id="brightness" type="number" min="-2" max="2"></label>
+<label>Contrasto (-2..2)<input id="contrast" type="number" min="-2" max="2"></label>
+<label>Saturazione (-2..2)<input id="saturation" type="number" min="-2" max="2"></label>
+<label><input id="horizontal_mirror" type="checkbox"> Immagine specchiata</label>
+<label><input id="vertical_flip" type="checkbox"> Immagine capovolta</label>
+<label>Durata registrazione, secondi<input id="event_video_sec" type="number" min="1" max="60"></label>
+<label>Retention locale, giorni<input id="retention_days" type="number" min="1"></label>
+<label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
+<button onclick="saveConfig()">Salva configurazione</button><div id="saveResult"></div></div>
 </div>
-
-<div class="card" style="margin-top:16px">
-<h2>Ultime acquisizioni</h2>
-<table>
-<thead><tr><th>Ora</th><th>Camera</th><th>Tipo</th><th>File</th><th>Cloud</th></tr></thead>
-<tbody id="events"></tbody>
-</table>
-</div>
+<div class="card" style="margin-top:14px"><h2>Ultime acquisizioni</h2><table><thead><tr><th>Ora</th><th>Tipo</th><th>Evento</th><th>File</th><th>Dimensione</th><th>Cloud</th><th>SHA-256</th></tr></thead><tbody id="events"></tbody></table></div>
 </main>
 <script>
+let cfg={};let currentStream='';
+function fmtBytes(n){if(!n)return '0';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return (n/1024).toFixed(1)+' KB'}
 async function refresh(){
-  const st=await fetch('/api/status').then(r=>r.json());
-  document.getElementById('status').innerHTML =
-    'Server: <b>'+st.server_name+'</b><br>'+
-    'Foto archiviate: '+st.photo_count+'<br>'+
-    'Spazio dati: '+st.data_mb+' MB<br>'+
-    'Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>'+
-    'Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+'<br>'+
-    'Pendenti cloud: '+st.pending_cloud;
-
-  if(st.latest_url){
-    document.getElementById('latest').src=st.latest_url+'?t='+Date.now();
-    document.getElementById('latestInfo').textContent=st.latest_name || '';
-  }
-
-  const cfg=await fetch('/api/config').then(r=>r.json());
-  for(const k of ['camera_id','camera_name','upload_token','snapshot_interval_sec','event_video_sec','drive_remote','drive_root']){
-    document.getElementById(k).value=cfg[k] ?? '';
-  }
-  document.getElementById('drive_enabled').checked=!!cfg.drive_enabled;
-
-  const items=await fetch('/api/recent').then(r=>r.json());
-  document.getElementById('events').innerHTML=items.map(x =>
-    '<tr><td>'+(x.captured_at||'')+'</td><td>'+(x.camera_id||'')+'</td><td>'+(x.event_type||'')+
-    '</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+x.cloud_status+'</td></tr>'
-  ).join('');
+ const st=await fetch('/api/status').then(r=>r.json());
+ document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+'<br>Pendenti cloud: '+st.pending_cloud;
+ if(st.latest_url){document.getElementById('latest').src=st.latest_url+'?t='+Date.now();document.getElementById('latestInfo').textContent=st.latest_name||''}
+ cfg=await fetch('/api/config').then(r=>r.json());
+ for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days']) document.getElementById(k).value=cfg[k];
+ for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
+ const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
+ if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'');if(n.stream_url&&n.stream_url!==currentStream){currentStream=n.stream_url;document.getElementById('live').src=currentStream+'?t='+Date.now()}}
+ const items=await fetch('/api/recent?limit=80').then(r=>r.json());document.getElementById('events').innerHTML=items.map(x=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+x.cloud_status+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
 }
-
-async function saveConfig(){
-  const old=await fetch('/api/config').then(r=>r.json());
-  const cfg={...old};
-  for(const k of ['camera_id','camera_name','upload_token','drive_remote','drive_root']){
-    cfg[k]=document.getElementById(k).value;
-  }
-  cfg.snapshot_interval_sec=parseInt(document.getElementById('snapshot_interval_sec').value);
-  cfg.event_video_sec=parseInt(document.getElementById('event_video_sec').value);
-  cfg.drive_enabled=document.getElementById('drive_enabled').checked;
-
-  const response=await fetch('/api/config',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(cfg)
-  });
-
-  document.getElementById('saveResult').textContent=response.ok?'Salvato':'Errore';
-  refresh();
-}
-
-async function syncPending(){
-  await fetch('/api/cloud/sync-pending',{method:'POST'});
-  setTimeout(refresh,1000);
-}
-
-refresh();
-setInterval(refresh,10000);
-</script>
-</body>
-</html>
+async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});document.getElementById('saveResult').textContent=r.ok?'Salvato. La camera applica i parametri entro circa 30 secondi.':'Errore';setTimeout(refresh,1000)}
+async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore: '+await r.text();setTimeout(refresh,1000)}
+async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});e.textContent=r.ok?'Video registrato e archiviato.':'Errore: '+await r.text();setTimeout(refresh,1000)}
+async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});document.getElementById('actionResult').textContent=r.ok?'Sincronizzazione avviata.':'Errore cloud';setTimeout(refresh,3000)}
+async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
+refresh();setInterval(refresh,10000);
+</script></body></html>
 """
 
 
@@ -316,12 +387,71 @@ def get_config():
 @app.post("/api/config")
 def set_config(cfg: ConfigModel):
     data = cfg.model_dump()
-    if data["snapshot_interval_sec"] < 1:
-        raise HTTPException(400, "snapshot_interval_sec must be >= 1")
-    if data["event_video_sec"] < 1:
-        raise HTTPException(400, "event_video_sec must be >= 1")
+    if not 1 <= data["snapshot_interval_sec"] <= 86400:
+        raise HTTPException(400, "snapshot_interval_sec must be 1..86400")
+    if not 1 <= data["event_video_sec"] <= 60:
+        raise HTTPException(400, "event_video_sec must be 1..60")
+    if data["camera_frame_size"] not in FRAME_SIZES:
+        raise HTTPException(400, "Unsupported camera_frame_size")
+    if not 4 <= data["jpeg_quality"] <= 30:
+        raise HTTPException(400, "jpeg_quality must be 4..30")
+    if not 1 <= data["stream_max_fps"] <= 10:
+        raise HTTPException(400, "stream_max_fps must be 1..10")
+    for name in ("brightness", "contrast", "saturation"):
+        if not -2 <= data[name] <= 2:
+            raise HTTPException(400, f"{name} must be -2..2")
     save_config(data)
+    if data.get("drive_enabled"):
+        queue_cloud_sync()
     return {"ok": True}
+
+
+@app.get("/api/node/config/{camera_id}")
+def node_config(camera_id: str, x_cam_token: str | None = Header(default=None)):
+    cfg = load_config()
+    if x_cam_token != cfg["upload_token"]:
+        raise HTTPException(401, "Invalid camera token")
+    return {
+        "camera_id": camera_id,
+        "snapshot_interval_sec": cfg["snapshot_interval_sec"],
+        "camera_frame_size": cfg["camera_frame_size"],
+        "jpeg_quality": cfg["jpeg_quality"],
+        "horizontal_mirror": cfg["horizontal_mirror"],
+        "vertical_flip": cfg["vertical_flip"],
+        "brightness": cfg["brightness"],
+        "contrast": cfg["contrast"],
+        "saturation": cfg["saturation"],
+        "stream_max_fps": cfg["stream_max_fps"],
+    }
+
+
+@app.post("/api/node/heartbeat")
+async def node_heartbeat(request: Request, x_cam_token: str | None = Header(default=None)):
+    cfg = load_config()
+    if x_cam_token != cfg["upload_token"]:
+        raise HTTPException(401, "Invalid camera token")
+    payload = await request.json()
+    camera_id = str(payload.get("camera_id") or cfg["camera_id"])
+    payload["camera_id"] = camera_id
+    payload["last_seen"] = now_local().isoformat()
+    payload["observed_ip"] = request.client.host if request.client else None
+    save_node(camera_id, payload)
+    return {"ok": True}
+
+
+@app.get("/api/nodes")
+def api_nodes():
+    now = now_local()
+    nodes: list[dict[str, Any]] = []
+    for path in NODES_DIR.glob("*.json"):
+        try:
+            node = json.loads(path.read_text(encoding="utf-8"))
+            seen = datetime.fromisoformat(node["last_seen"])
+            node["online"] = (now - seen).total_seconds() < 45
+            nodes.append(node)
+        except Exception:
+            continue
+    return nodes
 
 
 @app.post("/api/upload")
@@ -335,178 +465,156 @@ async def upload_image(
     cfg = load_config()
     if x_cam_token != cfg["upload_token"]:
         raise HTTPException(401, "Invalid camera token")
-
-    camera = camera_id or cfg["camera_id"]
-
     if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(415, "Only image uploads are accepted in V1")
-
+        raise HTTPException(415, "Only image uploads are accepted")
+    camera = camera_id or cfg["camera_id"]
     dt = now_local()
-    out_dir = camera_day_dir(camera, dt)
-    safe_event = "".join(
-        char for char in event_type.upper() if char.isalnum() or char in "_-"
-    )[:24] or "PHOTO"
-
-    filename = f"{camera}_{safe_event}_{dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
-    out_path = out_dir / filename
-
+    out_path = camera_day_dir(camera, dt) / make_filename(camera, event_type, dt, ".jpg")
     with out_path.open("wb") as output:
         shutil.copyfileobj(file.file, output)
-
-    meta = {
-        "camera_id": camera,
-        "event_type": event_type,
-        "captured_at": dt.isoformat(),
-        "received_at": now_local().isoformat(),
-        "filename": filename,
-        "size": out_path.stat().st_size,
-        "cloud_status": "PENDING" if cfg.get("drive_enabled") else "DISABLED",
-    }
-    write_metadata(out_path, meta)
-
-    if cfg.get("drive_enabled"):
-        background_tasks.add_task(upload_to_drive, out_path)
-
-    return {
-        "ok": True,
-        "file": filename,
-        "relative": out_path.relative_to(DATA_DIR).as_posix(),
-    }
+    register_media(out_path, camera, event_type, dt, "multipart")
+    return {"ok": True, "file": out_path.name, "relative": out_path.relative_to(DATA_DIR).as_posix()}
 
 
 @app.post("/api/upload/raw")
 async def upload_raw_image(
     request: Request,
-    background_tasks: BackgroundTasks,
     camera_id: str | None = None,
     event_type: str = "periodic",
     x_cam_token: str | None = Header(default=None),
 ):
-    """Receive a raw JPEG body from low-resource camera nodes such as ESP32-CAM."""
     cfg = load_config()
     if x_cam_token != cfg["upload_token"]:
         raise HTTPException(401, "Invalid camera token")
-
-    content_type = request.headers.get("content-type", "")
-    if not content_type.lower().startswith("image/jpeg"):
+    if not request.headers.get("content-type", "").lower().startswith("image/jpeg"):
         raise HTTPException(415, "Content-Type must be image/jpeg")
-
     payload = await request.body()
     if not payload:
         raise HTTPException(400, "Empty JPEG body")
     if len(payload) > 8 * 1024 * 1024:
         raise HTTPException(413, "Image too large")
-
     camera = camera_id or cfg["camera_id"]
     dt = now_local()
-    out_dir = camera_day_dir(camera, dt)
-    safe_event = "".join(
-        char for char in event_type.upper() if char.isalnum() or char in "_-"
-    )[:24] or "PHOTO"
-
-    filename = f"{camera}_{safe_event}_{dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
-    out_path = out_dir / filename
+    out_path = camera_day_dir(camera, dt) / make_filename(camera, event_type, dt, ".jpg")
     out_path.write_bytes(payload)
+    meta = register_media(out_path, camera, event_type, dt, "raw_jpeg")
+    return {"ok": True, "file": out_path.name, "relative": out_path.relative_to(DATA_DIR).as_posix(), "size": len(payload), "sha256": meta["sha256"]}
 
-    meta = {
-        "camera_id": camera,
-        "event_type": event_type,
-        "captured_at": dt.isoformat(),
-        "received_at": now_local().isoformat(),
-        "filename": filename,
-        "size": len(payload),
-        "source": "raw_jpeg",
-        "cloud_status": "PENDING" if cfg.get("drive_enabled") else "DISABLED",
-    }
-    write_metadata(out_path, meta)
 
-    if cfg.get("drive_enabled"):
-        background_tasks.add_task(upload_to_drive, out_path)
+def _node_url(camera_id: str, field: str, fallback_path: str) -> str:
+    node = get_node(camera_id)
+    if not node:
+        raise HTTPException(503, "Camera node has not sent a heartbeat yet")
+    url = node.get(field)
+    if not url:
+        base = str(node.get("base_url") or "").rstrip("/")
+        if not base:
+            raise HTTPException(503, "Camera node URL unavailable")
+        url = base + fallback_path
+    return str(url)
 
-    return {
-        "ok": True,
-        "file": filename,
-        "relative": out_path.relative_to(DATA_DIR).as_posix(),
-        "size": len(payload),
-    }
+
+@app.post("/api/camera/{camera_id}/capture")
+def manual_capture(camera_id: str):
+    url = _node_url(camera_id, "capture_url", "/capture")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "CamHub/0.4"})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = response.read(8 * 1024 * 1024)
+            if not payload:
+                raise HTTPException(502, "Camera returned an empty image")
+    except urllib.error.URLError as exc:
+        raise HTTPException(502, f"Camera capture failed: {exc}") from exc
+    dt = now_local()
+    out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, "manual", dt, ".jpg")
+    out_path.write_bytes(payload)
+    meta = register_media(out_path, camera_id, "manual", dt, "node_capture")
+    return {"ok": True, "file": out_path.name, "sha256": meta["sha256"]}
+
+
+@app.post("/api/camera/{camera_id}/record")
+def record_video(camera_id: str, duration: int | None = None):
+    cfg = load_config()
+    seconds = int(duration or cfg["event_video_sec"])
+    seconds = max(1, min(seconds, 60))
+    stream_url = _node_url(camera_id, "stream_url", "/stream")
+    if shutil.which("ffmpeg") is None:
+        raise HTTPException(500, "ffmpeg is not installed")
+    dt = now_local()
+    out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, f"video_{seconds}s", dt, ".mp4")
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", stream_url, "-t", str(seconds), "-an",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(out_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=seconds + 35)
+    except subprocess.TimeoutExpired as exc:
+        out_path.unlink(missing_ok=True)
+        raise HTTPException(504, "Video recording timed out") from exc
+    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        out_path.unlink(missing_ok=True)
+        raise HTTPException(502, "ffmpeg recording failed: " + (result.stderr or result.stdout)[-1200:])
+    meta = register_media(out_path, camera_id, f"video_{seconds}s", dt, "mjpeg_stream")
+    return {"ok": True, "file": out_path.name, "duration": seconds, "sha256": meta["sha256"]}
 
 
 @app.get("/api/recent")
-def api_recent(limit: int = 30):
+def api_recent(limit: int = 50):
     return recent_items(max(1, min(limit, 200)))
 
 
 @app.get("/api/status")
 def api_status():
     cfg = load_config()
-    jpgs = list(DATA_DIR.rglob("*.jpg"))
-    total_bytes = sum(path.stat().st_size for path in jpgs)
-
-    pending = 0
-    for path in jpgs:
-        meta_file = metadata_path(path)
-        if meta_file.exists():
-            try:
-                meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                if meta.get("cloud_status") in ("PENDING", "ERROR"):
-                    pending += 1
-            except Exception:
-                pass
-
+    files = media_files()
+    total_bytes = sum(path.stat().st_size for path in files)
+    pending = sum(1 for path in files if read_metadata(path).get("cloud_status") in ("PENDING", "ERROR", "UPLOADING"))
     latest = latest_jpg()
-
     return {
         "server_name": cfg["server_name"],
-        "photo_count": len(jpgs),
+        "media_count": len(files),
         "data_mb": round(total_bytes / 1024 / 1024, 2),
         "rclone_available": shutil.which("rclone") is not None,
         "drive_enabled": cfg.get("drive_enabled", False),
         "pending_cloud": pending,
         "latest_name": latest.name if latest else None,
-        "latest_url": (
-            f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None
-        ),
+        "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
     }
 
 
 @app.post("/api/cloud/sync-pending")
-def sync_pending(background_tasks: BackgroundTasks):
+def sync_pending():
     cfg = load_config()
     if not cfg.get("drive_enabled"):
         raise HTTPException(400, "Google Drive sync is disabled")
+    queue_cloud_sync()
+    return {"queued": True}
 
-    count = 0
-    for path in DATA_DIR.rglob("*.jpg"):
-        meta_file = metadata_path(path)
-        status = "PENDING"
 
-        if meta_file.exists():
-            try:
-                status = json.loads(
-                    meta_file.read_text(encoding="utf-8")
-                ).get("cloud_status", "PENDING")
-            except Exception:
-                pass
-
-        if status in ("PENDING", "ERROR"):
-            background_tasks.add_task(upload_to_drive, path)
-            count += 1
-
-    return {"queued": count}
+@app.post("/api/maintenance/cleanup")
+def cleanup_retention():
+    cfg = load_config()
+    cutoff = now_local() - timedelta(days=max(1, int(cfg.get("retention_days", 7))))
+    deleted = 0
+    for path in media_files():
+        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=now_local().tzinfo)
+        if modified < cutoff:
+            metadata_path(path).unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            deleted += 1
+    return {"deleted": deleted, "cutoff": cutoff.isoformat()}
 
 
 @app.get("/data/{file_path:path}")
 def serve_data(file_path: str):
     candidate = (DATA_DIR / file_path).resolve()
     data_root = DATA_DIR.resolve()
-
     if data_root not in candidate.parents and candidate != data_root:
         raise HTTPException(403, "Forbidden")
-
     if not candidate.exists() or not candidate.is_file():
         raise HTTPException(404, "File not found")
-
-    if candidate.suffix.lower() not in (".jpg", ".jpeg", ".json"):
+    if candidate.suffix.lower() not in (".jpg", ".jpeg", ".json", ".mp4"):
         raise HTTPException(403, "File type not served")
-
     return FileResponse(candidate)
