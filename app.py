@@ -24,7 +24,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.5.0")
+app = FastAPI(title="CamHub", version="0.5.1")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -34,6 +34,8 @@ frame_lock = threading.RLock()
 frame_cache: dict[str, dict[str, Any]] = {}
 stream_workers: dict[str, threading.Thread] = {}
 stream_workers_lock = threading.Lock()
+runtime_error_lock = threading.RLock()
+runtime_errors: list[dict[str, Any]] = []
 
 DEFAULT_CONFIG = {
     "server_name": "CamHub-RPI4",
@@ -58,7 +60,7 @@ DEFAULT_CONFIG = {
 }
 
 FRAME_SIZES = {"VGA", "SVGA", "XGA", "HD", "SXGA", "UXGA"}
-MEDIA_SUFFIXES = {".jpg", ".jpeg", ".mp4"}
+MEDIA_SUFFIXES = {".jpg", ".jpeg", ".mp4", ".txt"}
 
 
 class ConfigModel(BaseModel):
@@ -155,6 +157,8 @@ def make_filename(camera: str, event_type: str, dt: datetime, suffix: str) -> st
 
 def register_media(path: Path, camera: str, event_type: str, captured_at: datetime, source: str) -> dict[str, Any]:
     cfg = load_config()
+    suffix = path.suffix.lower()
+    media_type = "video" if suffix == ".mp4" else ("error" if suffix == ".txt" else "image")
     data = {
         "camera_id": camera,
         "event_type": event_type,
@@ -164,13 +168,53 @@ def register_media(path: Path, camera: str, event_type: str, captured_at: dateti
         "size": path.stat().st_size,
         "sha256": sha256_file(path),
         "source": source,
-        "media_type": "video" if path.suffix.lower() == ".mp4" else "image",
+        "media_type": media_type,
         "cloud_status": "PENDING" if cfg.get("drive_enabled") else "DISABLED",
     }
     write_metadata(path, data)
     if cfg.get("drive_enabled"):
         queue_cloud_sync()
     return data
+
+
+def record_runtime_error(source: str, detail: str, camera_id: str | None = None) -> None:
+    item = {
+        "time": now_local().isoformat(),
+        "source": source,
+        "camera_id": camera_id,
+        "detail": str(detail)[-6000:],
+    }
+    with runtime_error_lock:
+        runtime_errors.insert(0, item)
+        del runtime_errors[50:]
+
+
+def create_camera_error_file(camera_id: str, category: str, message: str, source: str = "camera") -> Path:
+    dt = now_local()
+    safe_category = "".join(ch for ch in category.upper() if ch.isalnum() or ch in "_-")[:32] or "ERROR"
+    out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, f"camera_error_{safe_category}", dt, ".txt")
+    node = get_node(camera_id) or {}
+    body = (
+        "CamNode error report\n"
+        f"timestamp: {dt.isoformat()}\n"
+        f"camera_id: {camera_id}\n"
+        f"category: {category}\n"
+        f"source: {source}\n"
+        f"firmware: {node.get('firmware', 'unknown')}\n"
+        f"ip: {node.get('ip', 'unknown')}\n"
+        f"rssi: {node.get('rssi', 'unknown')}\n"
+        "\nDETAILS\n"
+        f"{message}\n"
+    )
+    out_path.write_text(body, encoding="utf-8")
+    register_media(out_path, camera_id, f"camera_error_{safe_category}", dt, source)
+    update_metadata(
+        out_path,
+        error_message=str(message)[-6000:],
+        error_category=category,
+    )
+    record_runtime_error(source, message, camera_id)
+    return out_path
 
 
 def node_path(camera_id: str) -> Path:
@@ -261,7 +305,12 @@ def camera_stream_worker(camera_id: str) -> None:
                         buffer = buffer[end + 2:]
                         if len(frame) > 1024:
                             set_live_frame(camera_id, frame)
-        except Exception:
+        except Exception as exc:
+            node = get_node(camera_id) or {"camera_id": camera_id}
+            node["last_stream_error"] = str(exc)[-2000:]
+            node["last_stream_error_at"] = now_local().isoformat()
+            save_node(camera_id, node)
+            record_runtime_error("camera_stream", str(exc), camera_id)
             time.sleep(1.0)
 
 
@@ -306,7 +355,15 @@ def recent_items(limit: int = 50) -> list[dict[str, Any]]:
             "cloud_status": meta.get("cloud_status", "PENDING"),
             "size": path.stat().st_size,
             "sha256": meta.get("sha256"),
-            "media_type": meta.get("media_type", "video" if path.suffix.lower() == ".mp4" else "image"),
+            "media_type": meta.get(
+                "media_type",
+                "video" if path.suffix.lower() == ".mp4" else ("error" if path.suffix.lower() == ".txt" else "image"),
+            ),
+            "source": meta.get("source"),
+            "cloud_error": meta.get("cloud_error"),
+            "cloud_error_at": meta.get("cloud_error_at"),
+            "error_message": meta.get("error_message"),
+            "error_category": meta.get("error_category"),
         })
     return items
 
@@ -368,14 +425,29 @@ def sync_pending_batch() -> int:
 
         ok, error = _rclone_batch(first_batch, cfg)
         if not ok:
+            failed_at = now_local().isoformat()
+            record_runtime_error("google_drive", error)
             for path in pending:
-                update_metadata(path, cloud_status="ERROR", cloud_error=error)
+                meta = read_metadata(path)
+                update_metadata(
+                    path,
+                    cloud_status="ERROR",
+                    cloud_error=error,
+                    cloud_error_at=failed_at,
+                    cloud_attempts=int(meta.get("cloud_attempts") or 0) + 1,
+                )
             return 0
 
         synced_at = now_local().isoformat()
         meta_files: list[Path] = []
         for path in pending:
-            update_metadata(path, cloud_status="SYNCED", cloud_synced_at=synced_at, cloud_error=None)
+            update_metadata(
+                path,
+                cloud_status="SYNCED",
+                cloud_synced_at=synced_at,
+                cloud_error=None,
+                cloud_error_at=None,
+            )
             meta_files.append(metadata_path(path))
 
         _rclone_batch(meta_files, cfg)
@@ -389,8 +461,8 @@ def cloud_worker() -> None:
         time.sleep(2.0)
         try:
             sync_pending_batch()
-        except Exception:
-            pass
+        except Exception as exc:
+            record_runtime_error("cloud_worker", str(exc))
 
 
 def ensure_cloud_worker() -> None:
@@ -445,10 +517,11 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
 <button onclick="saveConfig()">Salva configurazione</button><div id="saveResult"></div></div>
 </div>
+<div class="card" style="margin-top:14px"><h2>Errori recenti</h2><div id="errors" class="muted">Nessun errore recente.</div></div>
 <div class="card" style="margin-top:14px"><h2>Ultime acquisizioni</h2><table><thead><tr><th>Ora</th><th>Tipo</th><th>Evento</th><th>File</th><th>Dimensione</th><th>Cloud</th><th>SHA-256</th></tr></thead><tbody id="events"></tbody></table></div>
 </main>
 <script>
-let cfg={};let currentStream='';
+let cfg={};let currentStream='';let recentMedia=[];
 function fmtBytes(n){if(!n)return '0';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return (n/1024).toFixed(1)+' KB'}
 async function refresh(){
  const st=await fetch('/api/status').then(r=>r.json());
@@ -460,11 +533,17 @@ async function refresh(){
  document.getElementById('recordButton').textContent='Registra '+(cfg.event_video_sec||10)+' secondi';
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
  if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')+' · sorgente '+(n.ingest_fps||0)+' fps';const proxy='/api/camera/'+n.camera_id+'/live';if(proxy!==currentStream){currentStream=proxy;document.getElementById('live').src=proxy+'?t='+Date.now()}}
- const items=await fetch('/api/recent?limit=80').then(r=>r.json());document.getElementById('events').innerHTML=items.map(x=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+x.cloud_status+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
+ recentMedia=await fetch('/api/recent?limit=80').then(r=>r.json());
+ document.getElementById('events').innerHTML=recentMedia.map((x,i)=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+(x.cloud_status==='ERROR'?'<button onclick="showMediaError('+i+')">ERROR - dettagli</button>':x.cloud_status)+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
+ const errs=await fetch('/api/errors?limit=12').then(r=>r.json());
+ const box=document.getElementById('errors');
+ if(!errs.length){box.textContent='Nessun errore recente.'}else{box.innerHTML='';errs.forEach(er=>{const d=document.createElement('div');d.style.cssText='border-bottom:1px solid #30343b;padding:8px 0';const h=document.createElement('div');h.textContent=(er.time||'')+' · '+(er.source||'errore')+(er.camera_id?' · '+er.camera_id:'');h.className='bad';const p=document.createElement('pre');p.style.cssText='white-space:pre-wrap;word-break:break-word;margin:5px 0 0';p.textContent=er.detail||'';d.appendChild(h);d.appendChild(p);box.appendChild(d)})}
 }
+function showMediaError(i){const x=recentMedia[i];const detail=x.cloud_error||x.error_message||'Nessun dettaglio disponibile';const box=document.getElementById('errors');box.innerHTML='';const h=document.createElement('div');h.className='bad';h.textContent=(x.file||'')+' · '+(x.cloud_status||'');const p=document.createElement('pre');p.style.cssText='white-space:pre-wrap;word-break:break-word';p.textContent=detail;box.appendChild(h);box.appendChild(p);box.scrollIntoView({behavior:'smooth'})}
+async function apiErrorText(r){try{const j=await r.json();return j.detail||j.error||JSON.stringify(j)}catch(e){try{return await r.text()}catch(e2){return 'Errore HTTP '+r.status}}}
 async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
-async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore: '+await r.text();setTimeout(refresh,1000)}
-async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore: '+await r.text()}setTimeout(refresh,800)}
+async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore scatto: '+await apiErrorText(r);setTimeout(refresh,1000)}
+async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,800)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});document.getElementById('actionResult').textContent=r.ok?'Sincronizzazione avviata.':'Errore cloud';setTimeout(refresh,3000)}
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
 refresh();setInterval(refresh,10000);
@@ -532,6 +611,31 @@ def node_config(camera_id: str, x_cam_token: str | None = Header(default=None)):
         "contrast": cfg["contrast"],
         "saturation": cfg["saturation"],
         "stream_max_fps": cfg["stream_max_fps"],
+    }
+
+
+@app.post("/api/node/error")
+async def node_error(
+    request: Request,
+    camera_id: str | None = None,
+    category: str = "camera",
+    x_cam_token: str | None = Header(default=None),
+):
+    cfg = load_config()
+    if x_cam_token != cfg["upload_token"]:
+        raise HTTPException(401, "Invalid camera token")
+
+    camera = camera_id or cfg["camera_id"]
+    payload = await request.body()
+    message = payload[:16384].decode("utf-8", errors="replace").strip()
+    if not message:
+        raise HTTPException(400, "Empty error report")
+
+    path = create_camera_error_file(camera, category, message, "camera_firmware")
+    return {
+        "ok": True,
+        "file": path.name,
+        "relative": path.relative_to(DATA_DIR).as_posix(),
     }
 
 
@@ -663,10 +767,12 @@ def manual_capture(camera_id: str):
             with urllib.request.urlopen(req, timeout=10) as response:
                 payload = response.read(8 * 1024 * 1024)
         except urllib.error.URLError as exc:
-            raise HTTPException(502, f"Camera capture failed: {exc}") from exc
+            path = create_camera_error_file(camera_id, "manual_capture", f"Camera capture failed: {exc}", "camera_proxy")
+            raise HTTPException(502, f"Camera capture failed: {exc}. Error file: {path.name}") from exc
 
     if not payload:
-        raise HTTPException(502, "Camera returned an empty image")
+        path = create_camera_error_file(camera_id, "manual_capture", "Camera returned an empty image", "camera_proxy")
+        raise HTTPException(502, f"Camera returned an empty image. Error file: {path.name}")
 
     dt = now_local()
     out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, "manual", dt, ".jpg")
@@ -791,6 +897,47 @@ def api_recent(limit: int = 50):
     return recent_items(max(1, min(limit, 200)))
 
 
+@app.get("/api/errors")
+def api_errors(limit: int = 20):
+    max_items = max(1, min(limit, 100))
+    errors: list[dict[str, Any]] = []
+
+    with runtime_error_lock:
+        errors.extend(dict(item) for item in runtime_errors[:max_items])
+
+    for path in media_files():
+        meta = read_metadata(path)
+        detail = meta.get("cloud_error") or meta.get("error_message")
+        if not detail:
+            continue
+        errors.append({
+            "time": meta.get("cloud_error_at") or meta.get("captured_at") or meta.get("received_at"),
+            "source": "google_drive" if meta.get("cloud_error") else meta.get("source", "media"),
+            "camera_id": meta.get("camera_id"),
+            "detail": str(detail)[-6000:],
+            "file": path.name,
+        })
+
+    errors.sort(key=lambda item: str(item.get("time") or ""), reverse=True)
+
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in errors:
+        key = (
+            str(item.get("time") or ""),
+            str(item.get("source") or ""),
+            str(item.get("detail") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if len(unique) >= max_items:
+            break
+
+    return unique
+
+
 @app.get("/api/status")
 def api_status():
     cfg = load_config()
@@ -841,6 +988,6 @@ def serve_data(file_path: str):
         raise HTTPException(403, "Forbidden")
     if not candidate.exists() or not candidate.is_file():
         raise HTTPException(404, "File not found")
-    if candidate.suffix.lower() not in (".jpg", ".jpeg", ".json", ".mp4"):
+    if candidate.suffix.lower() not in (".jpg", ".jpeg", ".json", ".mp4", ".txt"):
         raise HTTPException(403, "File type not served")
     return FileResponse(candidate)
