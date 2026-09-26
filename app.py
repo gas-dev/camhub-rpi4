@@ -93,6 +93,8 @@ def load_config() -> dict[str, Any]:
                 existing = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             except Exception:
                 existing = {}
+        if "camera_frame_size" not in existing and existing.get("event_video_sec") == 30:
+            existing["event_video_sec"] = 10
         merged = {**DEFAULT_CONFIG, **existing}
         if merged != existing:
             save_config(merged)
@@ -330,7 +332,7 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 </style></head>
 <body><header><h1>CamHub</h1><div class="muted">ESP32-CAM + Raspberry Pi</div></header><main>
 <div class="grid">
-<div class="card"><h2>Live</h2><img id="live" class="live" alt="Live non disponibile"><div id="nodeInfo" class="muted"></div><div class="actions"><button onclick="manualCapture()">Scatta ora</button><button onclick="recordVideo()">Registra 10 secondi</button></div><div id="actionResult"></div></div>
+<div class="card"><h2>Live</h2><img id="live" class="live" alt="Live non disponibile"><div id="nodeInfo" class="muted"></div><div class="actions"><button onclick="manualCapture()">Scatta ora</button><button id="recordButton" onclick="recordVideo()">Registra video</button></div><div id="actionResult"></div></div>
 <div class="card"><h2>Ultima foto archiviata</h2><img id="latest" class="latest"><div id="latestInfo" class="muted"></div></div>
 <div class="card"><h2>Stato server</h2><div id="status">Caricamento...</div><div class="actions"><button onclick="syncPending()">Sincronizza cloud</button><button onclick="cleanupOld()">Pulizia retention</button></div></div>
 <div class="card"><h2>Configurazione camera</h2>
@@ -360,6 +362,7 @@ async function refresh(){
  cfg=await fetch('/api/config').then(r=>r.json());
  for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days']) document.getElementById(k).value=cfg[k];
  for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
+ document.getElementById('recordButton').textContent='Registra '+(cfg.event_video_sec||10)+' secondi';
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
  if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'');if(n.stream_url&&n.stream_url!==currentStream){currentStream=n.stream_url;document.getElementById('live').src=currentStream+'?t='+Date.now()}}
  const items=await fetch('/api/recent?limit=80').then(r=>r.json());document.getElementById('events').innerHTML=items.map(x=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+x.cloud_status+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
