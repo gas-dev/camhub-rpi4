@@ -20,3 +20,5 @@ token*.json
 *.jpeg
 *.png
 .DS_Store
+
+google_oauth.json
