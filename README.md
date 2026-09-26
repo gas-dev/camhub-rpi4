@@ -1,107 +1,91 @@
 # CamHub RPi4
 
-CamHub is the Raspberry Pi 4 server for the CamNode camera project.
+CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## V1 scope
+## Current version: 0.4.0
 
-The first version intentionally keeps the architecture simple:
+Architecture:
 
-ESP32-CAM -> HTTP JPEG upload -> Raspberry Pi 4 -> local archive -> Google Drive
+    ESP32-CAM -> Wi-Fi -> Raspberry Pi 4 -> local archive -> Google Drive
 
-Current features:
+Current functions:
 
-- JPEG upload endpoint with camera token
+- raw JPEG and multipart JPEG upload
 - automatic folders by camera and date
-- JSON metadata beside each acquired image
-- local web dashboard
-- latest image and recent acquisition list
-- basic configuration page
-- optional Google Drive synchronization through rclone
-- retry of pending or failed cloud uploads
+- JSON sidecar metadata
+- SHA-256 hash for every archived photo and video
+- live node heartbeat and online/offline status
+- automatic discovery of the camera LAN address
+- live MJPEG view from the dashboard
+- manual still capture from the dashboard
+- 10-second video recording by default through FFmpeg
+- configurable recording duration up to 60 seconds
+- Raspberry-side MP4/H.264 creation
+- camera resolution control
+- JPEG quality control
+- mirror and vertical flip control
+- brightness, contrast and saturation control
+- configurable live FPS
+- configurable periodic snapshot interval
+- local retention cleanup
+- recent media list for photos and videos
+- batched Google Drive synchronization with multiple transfers
+- retry of failed cloud items
 - local operation when Internet or Google Drive is unavailable
 
-## Raspberry Pi
+## Raspberry Pi update
 
-Recommended OS: Raspberry Pi OS Lite 64-bit.
+    cd /home/germano/camhub-rpi4
+    git pull
+    sudo systemctl restart camhub
+    systemctl status camhub --no-pager
 
-Clone the repository:
-
-    git clone https://github.com/gas-dev/camhub-rpi4.git
-    cd camhub-rpi4
-    chmod +x install_rpi.sh install_service.sh
-    ./install_rpi.sh
-
-Run manually for the first test:
-
-    .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080
-
-Find the Raspberry Pi address:
-
-    hostname -I
-
-Open from another device on the LAN:
+Dashboard:
 
     http://RASPBERRY_IP:8080
 
-When the manual test is successful:
-
-    ./install_service.sh
-
 ## Google Drive
 
-Configure rclone:
-
-    rclone config
-
-Create a Google Drive remote named gdrive, then test it:
-
-    rclone lsd gdrive:
-
-Enable Drive from the CamHub dashboard after the rclone remote works.
+The Google Drive remote remains managed through rclone.
 
 Default destination:
 
     gdrive:CamHub/CAM01/YYYY/MM/DD/
 
-## Test without ESP32-CAM
+CamHub v0.4 batches pending media and metadata into fewer rclone operations instead of starting a separate cloud transfer for every image. This reduces process overhead and should make bursts of captures noticeably faster.
 
-On a PC with Python:
+## Video
 
-    pip install requests
-    python test_upload.py test.jpg --server http://RASPBERRY_IP:8080 --token change-me-now
+CamNode exposes an MJPEG stream on port 81. CamHub records the stream using FFmpeg and converts it to browser-friendly H.264 MP4.
 
-The JPEG should immediately appear in the CamHub dashboard.
+Default recording duration:
 
-## Camera API contract
+    10 seconds
 
-The first CamNode firmware will upload JPEG images using:
+The duration can be changed in the dashboard up to 60 seconds for testing.
 
-    POST /api/upload?camera_id=CAM01&event_type=periodic
-    X-Cam-Token: <configured token>
-    multipart field: file
+## Camera configuration
 
-## Configuration and secrets
+CamNode requests configuration from CamHub every approximately 30 seconds. Changes from the dashboard therefore do not require reflashing the ESP32.
 
-config.json is generated locally and is intentionally excluded from Git. Use config.example.json as the template.
+Default test profile:
 
-Do not commit Wi-Fi passwords, Google credentials, rclone configuration, operational databases, acquired photos or videos.
+    SXGA
+    JPEG quality 8
+    mirror off
+    flip off
+    5 FPS live
+    60-second periodic snapshots
 
-## Roadmap
+If SXGA live streaming is too heavy for the ESP32-CAM, XGA is the recommended first fallback while keeping materially better detail than the original SVGA test.
 
-V2:
-- ESP32-CAM firmware
-- automatic configurable snapshots
-- manual snapshot from CamHub
-- live MJPEG streaming
-- ESP32 diagnostics
+## Not yet enabled
 
-V3:
-- motion events
-- event video on Raspberry with FFmpeg
-- configurable event duration
-- Google Drive video upload
+The following are intentionally deferred until the live/video build is stable:
 
-V4:
-- pre-event and post-event buffering
-- event timeline
-- multi-camera support
+- automatic motion-triggered recording
+- pre-event ring buffer
+- microSD offline queue
+- OTA firmware deployment
+- production authentication and encryption
+- multi-camera fleet management
