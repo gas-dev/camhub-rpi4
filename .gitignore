@@ -4,6 +4,7 @@ __pycache__/
 .env
 config.json
 data/
+nodes/
 *.db
 *.sqlite
 *.sqlite3
