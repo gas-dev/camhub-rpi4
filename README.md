@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.6.0
+## Current version: 0.6.1
 
 Architecture:
 
@@ -181,3 +181,28 @@ The OAuth token is never returned to dashboard JavaScript and is never committed
 The dashboard connection uses the Google Drive drive.file scope. This deliberately limits CamHub/rclone to files and folders created by this OAuth application, instead of granting access to every file already present in the user's Drive.
 
 The older setup_gdrive_oauth.sh flow remains available as an administrative fallback.
+
+
+## Google device OAuth client secret
+
+CamHub 0.6.1 fixes the Google limited-input OAuth token exchange.
+
+Google's device authorization flow requires the OAuth Client Secret when polling the token endpoint for a TVs / Limited Input Devices client. The dashboard therefore accepts the Client Secret the first time the Google account is linked.
+
+Security behavior:
+
+- the Client Secret is saved only on the Raspberry Pi in google_oauth.json
+- google_oauth.json is ignored by Git
+- file permissions are set to 0600
+- the secret is never returned by the API
+- the secret is never repopulated into the browser after it has been saved
+- later reconnects can leave the Client Secret field blank
+- rclone receives the same Client ID and Client Secret so refresh-token operations use the dedicated Google OAuth client
+
+Google Cloud location:
+
+    Google Cloud Console -> Google Auth Platform / Clients
+    -> open the TVs and Limited Input Devices client
+    -> copy Client ID and Client Secret
+
+After updating CamHub, enter both values once and press "Collega Google Drive".
