@@ -26,7 +26,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.6.3")
+app = FastAPI(title="CamHub", version="0.6.4")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -1300,28 +1300,35 @@ def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]
 def manual_capture(camera_id: str):
     ensure_stream_worker(camera_id)
 
-    cached = get_live_frame(camera_id, max_age=3.0)
-    payload = bytes(cached["frame"]) if cached else b""
+    deadline = time.monotonic() + 6.0
+    cached = get_live_frame(camera_id, max_age=5.0)
 
-    if not payload:
-        url = _node_url(camera_id, "capture_url", "/capture")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "CamHub/0.5", "Connection": "close"})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                payload = response.read(8 * 1024 * 1024)
-        except urllib.error.URLError as exc:
-            path = create_camera_error_file(camera_id, "manual_capture", f"Camera capture failed: {exc}", "camera_proxy")
-            raise HTTPException(502, f"Camera capture failed: {exc}. Error file: {path.name}") from exc
+    while cached is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+        cached = get_live_frame(camera_id, max_age=5.0)
 
+    if cached is None:
+        message = "Manual capture unavailable because the shared live stream has no recent frame"
+        record_runtime_error("manual_capture", message, camera_id)
+        raise HTTPException(503, message)
+
+    payload = bytes(cached["frame"])
     if not payload:
-        path = create_camera_error_file(camera_id, "manual_capture", "Camera returned an empty image", "camera_proxy")
-        raise HTTPException(502, f"Camera returned an empty image. Error file: {path.name}")
+        message = "Manual capture unavailable because the shared live frame is empty"
+        record_runtime_error("manual_capture", message, camera_id)
+        raise HTTPException(503, message)
 
     dt = now_local()
     out_path = camera_day_dir(camera_id, dt) / make_filename(camera_id, "manual", dt, ".jpg")
     out_path.write_bytes(payload)
-    meta = register_media(out_path, camera_id, "manual", dt, "live_frame")
-    return {"ok": True, "file": out_path.name, "sha256": meta["sha256"]}
+    meta = register_media(out_path, camera_id, "manual", dt, "shared_live_stream")
+    return {
+        "ok": True,
+        "file": out_path.name,
+        "sha256": meta["sha256"],
+        "source": "shared_live_stream",
+        "frame_age_sec": round(max(0.0, time.monotonic() - float(cached.get("received_mono") or time.monotonic())), 3),
+    }
 
 
 @app.post("/api/camera/{camera_id}/record")
