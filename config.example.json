@@ -17,5 +17,8 @@
   "brightness": 0,
   "contrast": 0,
   "saturation": 0,
-  "stream_max_fps": 5
+  "stream_max_fps": 5,
+  "cloud_batch_delay_sec": 5,
+  "cloud_rate_limit_backoff_sec": 600,
+  "cloud_tps_limit": 8
 }
