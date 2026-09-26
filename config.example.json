@@ -4,6 +4,7 @@
   "camera_name": "Camera 1",
   "upload_token": "change-me-now",
   "snapshot_interval_sec": 60,
+  "camera_mode": "automatic",
   "event_video_sec": 10,
   "motion_enabled": false,
   "drive_enabled": false,
