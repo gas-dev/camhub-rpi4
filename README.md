@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.5.0
+## Current version: 0.5.1
 
 Architecture:
 
@@ -78,3 +78,21 @@ Default destination:
 - OTA firmware deployment
 - production authentication and encryption
 - multi-camera fleet management
+
+
+## Error diagnostics
+
+CamHub 0.5.1 exposes detailed errors in the dashboard.
+
+- Google Drive/rclone failures show the actual stored error text
+- ERROR entries in the media table have a details button
+- recent runtime, stream and cloud errors are shown in an Errori recenti panel
+- camera-originated errors are archived as TXT files beside the normal media
+- camera error TXT files receive SHA-256 metadata and are queued for Google Drive like other evidence files
+- historical cloud ERROR rows can show their previously stored cloud_error after upgrading CamHub
+
+Camera error files use names similar to:
+
+    CAM01_CAMERA_ERROR_SNAPSHOT_CAPTURE_YYYYMMDD_HHMMSS_mmm.txt
+
+A cloud ERROR does not by itself mean the camera failed. If the image/video exists locally with size and SHA-256, acquisition succeeded and the failure happened during cloud synchronization.
