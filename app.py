@@ -26,7 +26,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.6.2")
+app = FastAPI(title="CamHub", version="0.6.3")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -39,6 +39,8 @@ frame_lock = threading.RLock()
 frame_cache: dict[str, dict[str, Any]] = {}
 stream_workers: dict[str, threading.Thread] = {}
 stream_workers_lock = threading.Lock()
+periodic_worker_started = False
+periodic_last_capture: dict[str, float] = {}
 runtime_error_lock = threading.RLock()
 runtime_errors: list[dict[str, Any]] = []
 google_oauth_lock = threading.RLock()
@@ -388,6 +390,58 @@ def ensure_stream_worker(camera_id: str) -> None:
         )
         stream_workers[camera_id] = worker
         worker.start()
+
+
+def periodic_snapshot_worker() -> None:
+    while True:
+        try:
+            cfg = load_config()
+            camera_id = str(cfg.get("camera_id") or "CAM01")
+            interval = max(1, int(cfg.get("snapshot_interval_sec", 60)))
+            now_mono = time.monotonic()
+
+            ensure_stream_worker(camera_id)
+            cached = get_live_frame(camera_id, max_age=5.0)
+
+            if cached is not None:
+                last = periodic_last_capture.get(camera_id)
+
+                if last is None:
+                    periodic_last_capture[camera_id] = now_mono
+                elif now_mono - last >= interval:
+                    payload = bytes(cached["frame"])
+                    if payload:
+                        dt = now_local()
+                        out_path = (
+                            camera_day_dir(camera_id, dt)
+                            / make_filename(camera_id, "periodic", dt, ".jpg")
+                        )
+                        out_path.write_bytes(payload)
+                        register_media(
+                            out_path,
+                            camera_id,
+                            "periodic",
+                            dt,
+                            "shared_live_stream",
+                        )
+                        periodic_last_capture[camera_id] = now_mono
+
+        except Exception as exc:
+            record_runtime_error("periodic_snapshot_worker", str(exc))
+
+        time.sleep(0.5)
+
+
+def ensure_periodic_snapshot_worker() -> None:
+    global periodic_worker_started
+    if periodic_worker_started:
+        return
+    periodic_worker_started = True
+    threading.Thread(
+        target=periodic_snapshot_worker,
+        daemon=True,
+        name="camhub-periodic-snapshot",
+    ).start()
 
 
 def media_files() -> list[Path]:
@@ -873,6 +927,7 @@ def queue_cloud_sync(force: bool = False) -> None:
 def startup_event() -> None:
     load_config()
     ensure_cloud_worker()
+    ensure_periodic_snapshot_worker()
     if load_config().get("drive_enabled"):
         queue_cloud_sync()
 
@@ -1090,6 +1145,7 @@ def node_config(camera_id: str, x_cam_token: str | None = Header(default=None)):
     return {
         "camera_id": camera_id,
         "snapshot_interval_sec": cfg["snapshot_interval_sec"],
+        "snapshot_source": "raspberry_live_cache",
         "camera_frame_size": cfg["camera_frame_size"],
         "jpeg_quality": cfg["jpeg_quality"],
         "horizontal_mirror": cfg["horizontal_mirror"],
