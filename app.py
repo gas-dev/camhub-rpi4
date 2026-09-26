@@ -24,11 +24,14 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.5.1")
+app = FastAPI(title="CamHub", version="0.5.2")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
 cloud_worker_started = False
+cloud_backoff_until = 0.0
+cloud_backoff_reason = ""
+cloud_backoff_lock = threading.RLock()
 
 frame_lock = threading.RLock()
 frame_cache: dict[str, dict[str, Any]] = {}
@@ -403,6 +406,10 @@ def sync_pending_batch() -> int:
     if shutil.which("rclone") is None:
         return 0
 
+    status = cloud_backoff_status()
+    if status["active"]:
+        return 0
+
     with cloud_lock:
         pending: list[Path] = []
         for path in media_files():
@@ -427,6 +434,13 @@ def sync_pending_batch() -> int:
         if not ok:
             failed_at = now_local().isoformat()
             record_runtime_error("google_drive", error)
+
+            if is_rate_limit_error(error):
+                set_cloud_backoff(
+                    600,
+                    "Google Drive rate limit exceeded. Automatic sync paused for 10 minutes.",
+                )
+
             for path in pending:
                 meta = read_metadata(path)
                 update_metadata(
@@ -451,6 +465,7 @@ def sync_pending_batch() -> int:
             meta_files.append(metadata_path(path))
 
         _rclone_batch(meta_files, cfg)
+        clear_cloud_backoff()
         return len(pending)
 
 
@@ -473,8 +488,46 @@ def ensure_cloud_worker() -> None:
     threading.Thread(target=cloud_worker, daemon=True, name="camhub-cloud").start()
 
 
-def queue_cloud_sync() -> None:
+def cloud_backoff_status() -> dict[str, Any]:
+    with cloud_backoff_lock:
+        remaining = max(0.0, cloud_backoff_until - time.time())
+        return {
+            "active": remaining > 0,
+            "remaining_sec": int(remaining),
+            "until_epoch": cloud_backoff_until if remaining > 0 else None,
+            "reason": cloud_backoff_reason if remaining > 0 else "",
+        }
+
+
+def set_cloud_backoff(seconds: int, reason: str) -> None:
+    global cloud_backoff_until, cloud_backoff_reason
+    with cloud_backoff_lock:
+        cloud_backoff_until = max(cloud_backoff_until, time.time() + max(1, seconds))
+        cloud_backoff_reason = str(reason)[-3000:]
+
+
+def clear_cloud_backoff() -> None:
+    global cloud_backoff_until, cloud_backoff_reason
+    with cloud_backoff_lock:
+        cloud_backoff_until = 0.0
+        cloud_backoff_reason = ""
+
+
+def is_rate_limit_error(message: str) -> bool:
+    text = str(message).lower()
+    return (
+        "ratelimitexceeded" in text
+        or "rate_limit_exceeded" in text
+        or "quota exceeded" in text
+        or "requests per minute" in text
+    )
+
+
+def queue_cloud_sync(force: bool = False) -> None:
     ensure_cloud_worker()
+    status = cloud_backoff_status()
+    if status["active"] and not force:
+        return
     cloud_event.set()
 
 
@@ -525,7 +578,8 @@ let cfg={};let currentStream='';let recentMedia=[];
 function fmtBytes(n){if(!n)return '0';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return (n/1024).toFixed(1)+' KB'}
 async function refresh(){
  const st=await fetch('/api/status').then(r=>r.json());
- document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+'<br>Pendenti cloud: '+st.pending_cloud;
+ const bo=st.cloud_backoff||{};const boText=bo.active?'<br><span class="bad">Drive in pausa per rate limit: '+bo.remaining_sec+' sec</span>':'';
+ document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+'<br>Pendenti cloud: '+st.pending_cloud+boText;
  if(st.latest_url){document.getElementById('latest').src=st.latest_url+'?t='+Date.now();document.getElementById('latestInfo').textContent=st.latest_name||''}
  cfg=await fetch('/api/config').then(r=>r.json());
  for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days']) document.getElementById(k).value=cfg[k];
@@ -544,7 +598,7 @@ async function apiErrorText(r){try{const j=await r.json();return j.detail||j.err
 async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
 async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore scatto: '+await apiErrorText(r);setTimeout(refresh,1000)}
 async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,800)}
-async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});document.getElementById('actionResult').textContent=r.ok?'Sincronizzazione avviata.':'Errore cloud';setTimeout(refresh,3000)}
+async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent=j.paused?'Google Drive è temporaneamente in pausa per rate limit. Riprova tra '+j.remaining_sec+' secondi.':(r.ok?'Sincronizzazione avviata.':'Errore cloud');setTimeout(refresh,1500)}
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
 refresh();setInterval(refresh,10000);
 </script></body></html>
@@ -945,6 +999,7 @@ def api_status():
     total_bytes = sum(path.stat().st_size for path in files)
     pending = sum(1 for path in files if read_metadata(path).get("cloud_status") in ("PENDING", "ERROR", "UPLOADING"))
     latest = latest_jpg()
+    backoff = cloud_backoff_status()
     return {
         "server_name": cfg["server_name"],
         "media_count": len(files),
@@ -952,18 +1007,32 @@ def api_status():
         "rclone_available": shutil.which("rclone") is not None,
         "drive_enabled": cfg.get("drive_enabled", False),
         "pending_cloud": pending,
+        "cloud_backoff": backoff,
         "latest_name": latest.name if latest else None,
         "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
     }
 
 
 @app.post("/api/cloud/sync-pending")
-def sync_pending():
+def sync_pending(force: bool = False):
     cfg = load_config()
     if not cfg.get("drive_enabled"):
         raise HTTPException(400, "Google Drive sync is disabled")
-    queue_cloud_sync()
-    return {"queued": True}
+
+    status = cloud_backoff_status()
+    if status["active"] and not force:
+        return {
+            "queued": False,
+            "paused": True,
+            "remaining_sec": status["remaining_sec"],
+            "reason": status["reason"],
+        }
+
+    if force:
+        clear_cloud_backoff()
+
+    queue_cloud_sync(force=True)
+    return {"queued": True, "forced": force}
 
 
 @app.post("/api/maintenance/cleanup")
