@@ -4,10 +4,18 @@
   "camera_name": "Camera 1",
   "upload_token": "change-me-now",
   "snapshot_interval_sec": 60,
-  "event_video_sec": 30,
+  "event_video_sec": 10,
   "motion_enabled": false,
   "drive_enabled": false,
   "drive_remote": "gdrive",
   "drive_root": "CamHub",
-  "retention_days": 7
+  "retention_days": 7,
+  "camera_frame_size": "SXGA",
+  "jpeg_quality": 8,
+  "horizontal_mirror": false,
+  "vertical_flip": false,
+  "brightness": 0,
+  "contrast": 0,
+  "saturation": 0,
+  "stream_max_fps": 5
 }
