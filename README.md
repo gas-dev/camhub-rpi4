@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.5.3
+## Current version: 0.6.0
 
 Architecture:
 
@@ -150,3 +150,34 @@ These values can be changed from the dashboard.
 The dashboard includes Test Google Drive.
 
 It verifies the configured remote/root and reports whether a dedicated OAuth client is configured. The detailed rclone response is shown directly in the web interface and is also available in recent error diagnostics when the test fails.
+
+
+## Connect Google Drive from the dashboard
+
+CamHub 0.6.0 can complete Google Drive authorization directly from the web dashboard without manually copying OAuth tokens.
+
+Because a CamHub prototype normally runs on a private LAN address such as 192.168.x.x over HTTP, a normal Google web-server OAuth callback cannot be used directly. The dashboard therefore uses Google's limited-input/device authorization flow.
+
+One-time Google Cloud preparation:
+
+1. Enable Google Drive API in your Google Cloud project.
+2. Configure the OAuth consent screen.
+3. Create an OAuth client suitable for TVs / Limited Input Devices.
+4. Copy only the Client ID into CamHub. This flow does not require entering a Client Secret in the CamHub dashboard.
+
+Dashboard flow:
+
+1. Enter the Google OAuth Client ID.
+2. Click "Collega Google Drive".
+3. CamHub asks Google for a temporary user code.
+4. The Google authorization page opens in a new browser tab.
+5. Enter the displayed code and approve access.
+6. CamHub receives the access and refresh tokens server-side.
+7. The token is written directly into the local rclone configuration.
+8. CamHub creates/tests the configured Drive root and starts synchronizing pending files.
+
+The OAuth token is never returned to dashboard JavaScript and is never committed to Git.
+
+The dashboard connection uses the Google Drive drive.file scope. This deliberately limits CamHub/rclone to files and folders created by this OAuth application, instead of granting access to every file already present in the user's Drive.
+
+The older setup_gdrive_oauth.sh flow remains available as an administrative fallback.
