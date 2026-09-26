@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,10 +36,6 @@ cloud_backoff_until = 0.0
 cloud_backoff_reason = ""
 cloud_backoff_lock = threading.RLock()
 
-frame_lock = threading.RLock()
-frame_cache: dict[str, dict[str, Any]] = {}
-stream_workers: dict[str, threading.Thread] = {}
-stream_workers_lock = threading.Lock()
 camera_operation_worker_started = False
 automatic_scheduler_started = False
 camera_operation_lock = threading.RLock()
@@ -308,99 +304,6 @@ def get_node(camera_id: str) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-
-
-def set_live_frame(camera_id: str, frame: bytes) -> None:
-    now_mono = time.monotonic()
-    with frame_lock:
-        previous = frame_cache.get(camera_id, {})
-        previous_at = float(previous.get("received_mono") or 0.0)
-        previous_fps = float(previous.get("source_fps") or 0.0)
-        instant_fps = 0.0
-        if previous_at > 0 and now_mono > previous_at:
-            instant_fps = 1.0 / (now_mono - previous_at)
-        source_fps = instant_fps if previous_fps <= 0 else (previous_fps * 0.8 + instant_fps * 0.2)
-        frame_cache[camera_id] = {
-            "frame": frame,
-            "seq": int(previous.get("seq") or 0) + 1,
-            "received_mono": now_mono,
-            "received_at": time.time(),
-            "source_fps": min(source_fps, 60.0),
-        }
-
-
-def get_live_frame(camera_id: str, max_age: float = 10.0) -> dict[str, Any] | None:
-    with frame_lock:
-        item = frame_cache.get(camera_id)
-        if not item:
-            return None
-        if time.monotonic() - float(item.get("received_mono") or 0.0) > max_age:
-            return None
-        return dict(item)
-
-
-def camera_stream_worker(camera_id: str) -> None:
-    while True:
-        node = get_node(camera_id)
-        stream_url = str((node or {}).get("stream_url") or "")
-        if not stream_url:
-            time.sleep(1.0)
-            continue
-
-        try:
-            request = urllib.request.Request(
-                stream_url,
-                headers={"User-Agent": "CamHub/0.5", "Connection": "keep-alive"},
-            )
-            with urllib.request.urlopen(request, timeout=12) as response:
-                buffer = b""
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    buffer += chunk
-
-                    while True:
-                        start = buffer.find(b"\xff\xd8")
-                        if start < 0:
-                            if len(buffer) > 2:
-                                buffer = buffer[-2:]
-                            break
-
-                        end = buffer.find(b"\xff\xd9", start + 2)
-                        if end < 0:
-                            if start > 0:
-                                buffer = buffer[start:]
-                            if len(buffer) > 8 * 1024 * 1024:
-                                buffer = b""
-                            break
-
-                        frame = buffer[start:end + 2]
-                        buffer = buffer[end + 2:]
-                        if len(frame) > 1024:
-                            set_live_frame(camera_id, frame)
-        except Exception as exc:
-            node = get_node(camera_id) or {"camera_id": camera_id}
-            node["last_stream_error"] = str(exc)[-2000:]
-            node["last_stream_error_at"] = now_local().isoformat()
-            save_node(camera_id, node)
-            record_runtime_error("camera_stream", str(exc), camera_id)
-            time.sleep(1.0)
-
-
-def ensure_stream_worker(camera_id: str) -> None:
-    with stream_workers_lock:
-        worker = stream_workers.get(camera_id)
-        if worker and worker.is_alive():
-            return
-        worker = threading.Thread(
-            target=camera_stream_worker,
-            args=(camera_id,),
-            daemon=True,
-            name=f"camhub-stream-{camera_id}",
-        )
-        stream_workers[camera_id] = worker
-        worker.start()
 
 
 def camera_operation_status() -> dict[str, Any]:
@@ -1272,14 +1175,26 @@ async function refresh(){
  document.getElementById('photoButton').disabled=!manual;
  document.getElementById('recordButton').disabled=!manual;
  document.getElementById('modeInfo').innerHTML=manual?'<span class="ok"><b>MODALITÀ MANUALE</b></span> · automatico fermo':'<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · foto ogni '+cfg.snapshot_interval_sec+' secondi';
- const q=st.camera_queue||{};
- const active=q.active?('#'+q.active.id+' '+q.active.kind+' in esecuzione'):'nessuna operazione in esecuzione';
- const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
- document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · attesa '+(q.queue_length||0)+(queued?'<br>'+queued:'')+(!manual&&q.next_automatic_in_sec!==undefined?'<br>Prossima foto automatica tra '+q.next_automatic_in_sec+' s':'');
+ renderQueue(st.camera_queue||{},manual);
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
  if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')}
  recentMedia=await fetch('/api/recent?limit=80').then(r=>r.json());
  document.getElementById('events').innerHTML=recentMedia.map((x,i)=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+(x.cloud_status==='ERROR'?'<button onclick="showMediaError('+i+')">ERROR - dettagli</button>':x.cloud_status)+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
+}
+function renderQueue(q,manual){
+ const active=q.active?('#'+q.active.id+' '+q.active.kind+' in esecuzione'):'nessuna operazione in esecuzione';
+ const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
+ document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · attesa '+(q.queue_length||0)+(queued?'<br>'+queued:'')+(!manual&&q.next_automatic_in_sec!==undefined?'<br>Prossima foto automatica tra '+q.next_automatic_in_sec+' s':'');
+}
+async function refreshQueue(){
+ try{
+  const q=await fetch('/api/camera/queue').then(r=>r.json());
+  const manual=q.mode==='manual';
+  document.getElementById('photoButton').disabled=!manual;
+  document.getElementById('recordButton').disabled=!manual;
+  document.getElementById('modeInfo').innerHTML=manual?'<span class="ok"><b>MODALITÀ MANUALE</b></span> · automatico fermo':'<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · acquisizione seriale';
+  renderQueue(q,manual);
+ }catch(e){}
 }
 function showMediaError(i){window.location.href='/debug'}
 async function apiErrorText(r){try{const j=await r.json();return j.detail||j.error||JSON.stringify(j)}catch(e){try{return await r.text()}catch(e2){return 'Errore HTTP '+r.status}}}
@@ -1322,7 +1237,7 @@ async function disconnectGoogle(){
  setTimeout(refresh,600);
 }
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
-refresh();setInterval(refresh,10000);
+refresh();setInterval(refresh,5000);setInterval(refreshQueue,1000);
 </script></body></html>
 """
 
