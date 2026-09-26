@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.6.1
+## Current version: 0.6.2
 
 Architecture:
 
@@ -206,3 +206,42 @@ Google Cloud location:
     -> copy Client ID and Client Secret
 
 After updating CamHub, enter both values once and press "Collega Google Drive".
+
+
+## Debug page
+
+CamHub 0.6.2 keeps technical errors out of the main dashboard.
+
+Open:
+
+    http://RASPBERRY_IP:8080/debug
+
+The Debug page contains:
+
+- recent camera, Google OAuth, rclone and cloud errors
+- current Drive/backoff status
+- media currently in ERROR state
+- full technical error details
+- Google Drive connectivity test
+
+The main dashboard contains only a compact Debug / Errori link. An ERROR button in the media table opens the Debug page instead of expanding technical details into the main screen.
+
+## Daily manifest directory
+
+JSON metadata sidecars are now stored in a dedicated manifest directory inside each camera/day directory.
+
+Example local/cloud layout:
+
+    CAM01/
+      2026/
+        09/
+          26/
+            CAM01_PERIODIC_20260926_221503_189.jpg
+            CAM01_VIDEO_10S_20260926_220709_869.mp4
+            manifest/
+              CAM01_PERIODIC_20260926_221503_189.json
+              CAM01_VIDEO_10S_20260926_220709_869.json
+
+The same relative layout is preserved on Google Drive.
+
+Older adjacent JSON sidecars remain readable for backward compatibility. When an older media item is updated/retried, CamHub writes its current metadata into the new manifest directory.
