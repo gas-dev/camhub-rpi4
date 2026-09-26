@@ -24,7 +24,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.5.2")
+app = FastAPI(title="CamHub", version="0.5.3")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -60,6 +60,9 @@ DEFAULT_CONFIG = {
     "contrast": 0,
     "saturation": 0,
     "stream_max_fps": 5,
+    "cloud_batch_delay_sec": 5,
+    "cloud_rate_limit_backoff_sec": 600,
+    "cloud_tps_limit": 8,
 }
 
 FRAME_SIZES = {"VGA", "SVGA", "XGA", "HD", "SXGA", "UXGA"}
@@ -86,6 +89,9 @@ class ConfigModel(BaseModel):
     contrast: int = 0
     saturation: int = 0
     stream_max_fps: int = 5
+    cloud_batch_delay_sec: int = 5
+    cloud_rate_limit_backoff_sec: int = 600
+    cloud_tps_limit: int = 8
 
 
 def save_config(cfg: dict[str, Any]) -> None:
@@ -384,8 +390,11 @@ def _rclone_batch(files: list[Path], cfg: dict[str, Any]) -> tuple[bool, str]:
             [
                 "rclone", "copy", str(DATA_DIR), target,
                 "--files-from", str(temp_path),
-                "--transfers", "4", "--checkers", "4",
+                "--transfers", "2", "--checkers", "2",
                 "--retries", "3", "--low-level-retries", "5",
+                "--no-traverse",
+                "--tpslimit", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+                "--tpslimit-burst", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
             ],
             capture_output=True, text=True, timeout=900,
         )
@@ -436,9 +445,10 @@ def sync_pending_batch() -> int:
             record_runtime_error("google_drive", error)
 
             if is_rate_limit_error(error):
+                backoff_sec = max(60, int(cfg.get("cloud_rate_limit_backoff_sec", 600)))
                 set_cloud_backoff(
-                    600,
-                    "Google Drive rate limit exceeded. Automatic sync paused for 10 minutes.",
+                    backoff_sec,
+                    f"Google Drive rate limit exceeded. Automatic sync paused for {backoff_sec} seconds.",
                 )
 
             for path in pending:
@@ -471,9 +481,13 @@ def sync_pending_batch() -> int:
 
 def cloud_worker() -> None:
     while True:
-        cloud_event.wait()
+        signaled = cloud_event.wait(timeout=60.0)
         cloud_event.clear()
-        time.sleep(2.0)
+
+        cfg = load_config()
+        if signaled:
+            time.sleep(max(0, min(int(cfg.get("cloud_batch_delay_sec", 5)), 60)))
+
         try:
             sync_pending_batch()
         except Exception as exc:
@@ -523,6 +537,86 @@ def is_rate_limit_error(message: str) -> bool:
     )
 
 
+def rclone_config_path() -> Path | None:
+    if shutil.which("rclone") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["rclone", "config", "file"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("/") and line.endswith(".conf"):
+                return Path(line)
+    except Exception:
+        return None
+    return None
+
+
+def has_custom_drive_oauth(remote: str) -> bool:
+    path = rclone_config_path()
+    if not path or not path.exists():
+        return False
+    try:
+        import configparser
+        parser = configparser.RawConfigParser()
+        parser.read(path, encoding="utf-8")
+        if not parser.has_section(remote):
+            return False
+        return bool((parser.get(remote, "client_id", fallback="") or "").strip())
+    except Exception:
+        return False
+
+
+def drive_health() -> dict[str, Any]:
+    cfg = load_config()
+    remote = str(cfg.get("drive_remote") or "gdrive")
+    target = f"{remote}:{str(cfg.get('drive_root') or '').strip('/')}"
+    custom_oauth = has_custom_drive_oauth(remote)
+
+    if shutil.which("rclone") is None:
+        return {
+            "ok": False,
+            "remote": remote,
+            "target": target,
+            "custom_oauth": custom_oauth,
+            "detail": "rclone is not installed",
+        }
+
+    try:
+        result = subprocess.run(
+            [
+                "rclone", "lsd", target,
+                "--max-depth", "1",
+                "--tpslimit", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+                "--tpslimit-burst", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        detail = ((result.stderr or "") or (result.stdout or ""))[-5000:]
+        return {
+            "ok": result.returncode == 0,
+            "remote": remote,
+            "target": target,
+            "custom_oauth": custom_oauth,
+            "detail": detail,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "remote": remote,
+            "target": target,
+            "custom_oauth": custom_oauth,
+            "detail": str(exc),
+        }
+
+
 def queue_cloud_sync(force: bool = False) -> None:
     ensure_cloud_worker()
     status = cloud_backoff_status()
@@ -568,7 +662,10 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label>Durata registrazione, secondi<input id="event_video_sec" type="number" min="1" max="60"></label>
 <label>Retention locale, giorni<input id="retention_days" type="number" min="1"></label>
 <label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
-<button onclick="saveConfig()">Salva configurazione</button><div id="saveResult"></div></div>
+<label>Attesa batch cloud, secondi<input id="cloud_batch_delay_sec" type="number" min="0" max="60"></label>
+<label>Pausa su rate limit, secondi<input id="cloud_rate_limit_backoff_sec" type="number" min="60" max="86400"></label>
+<label>Limite richieste rclone al secondo<input id="cloud_tps_limit" type="number" min="1" max="100"></label>
+<div class="actions"><button onclick="saveConfig()">Salva configurazione</button><button onclick="testDrive()">Test Google Drive</button></div><div id="saveResult"></div></div>
 </div>
 <div class="card" style="margin-top:14px"><h2>Errori recenti</h2><div id="errors" class="muted">Nessun errore recente.</div></div>
 <div class="card" style="margin-top:14px"><h2>Ultime acquisizioni</h2><table><thead><tr><th>Ora</th><th>Tipo</th><th>Evento</th><th>File</th><th>Dimensione</th><th>Cloud</th><th>SHA-256</th></tr></thead><tbody id="events"></tbody></table></div>
@@ -579,10 +676,11 @@ function fmtBytes(n){if(!n)return '0';if(n>1048576)return (n/1048576).toFixed(1)
 async function refresh(){
  const st=await fetch('/api/status').then(r=>r.json());
  const bo=st.cloud_backoff||{};const boText=bo.active?'<br><span class="bad">Drive in pausa per rate limit: '+bo.remaining_sec+' sec</span>':'';
- document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+'<br>Pendenti cloud: '+st.pending_cloud+boText;
+ const oauthText=st.drive_custom_oauth?'<span class="ok">OAuth dedicato</span>':'<span class="bad">OAuth condiviso/default</span>';
+ document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+' · '+oauthText+'<br>Pendenti cloud: '+st.pending_cloud+boText;
  if(st.latest_url){document.getElementById('latest').src=st.latest_url+'?t='+Date.now();document.getElementById('latestInfo').textContent=st.latest_name||''}
  cfg=await fetch('/api/config').then(r=>r.json());
- for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days']) document.getElementById(k).value=cfg[k];
+ for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit']) document.getElementById(k).value=cfg[k];
  for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
  document.getElementById('recordButton').textContent='Registra '+(cfg.event_video_sec||10)+' secondi';
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
@@ -595,10 +693,11 @@ async function refresh(){
 }
 function showMediaError(i){const x=recentMedia[i];const detail=x.cloud_error||x.error_message||'Nessun dettaglio disponibile';const box=document.getElementById('errors');box.innerHTML='';const h=document.createElement('div');h.className='bad';h.textContent=(x.file||'')+' · '+(x.cloud_status||'');const p=document.createElement('pre');p.style.cssText='white-space:pre-wrap;word-break:break-word';p.textContent=detail;box.appendChild(h);box.appendChild(p);box.scrollIntoView({behavior:'smooth'})}
 async function apiErrorText(r){try{const j=await r.json();return j.detail||j.error||JSON.stringify(j)}catch(e){try{return await r.text()}catch(e2){return 'Errore HTTP '+r.status}}}
-async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
+async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';currentStream='';setTimeout(refresh,800)}
 async function manualCapture(){const e=document.getElementById('actionResult');e.textContent='Scatto in corso...';const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});e.textContent=r.ok?'Foto acquisita e archiviata.':'Errore scatto: '+await apiErrorText(r);setTimeout(refresh,1000)}
 async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;e.textContent='Registrazione '+d+' secondi in corso. Il live resta attivo...';const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video registrato: '+j.frames+' fotogrammi a '+j.fps+' fps, '+j.unique_source_frames+' frame sorgente distinti.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,800)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent=j.paused?'Google Drive è temporaneamente in pausa per rate limit. Riprova tra '+j.remaining_sec+' secondi.':(r.ok?'Sincronizzazione avviata.':'Errore cloud');setTimeout(refresh,1500)}
+async function testDrive(){const e=document.getElementById('actionResult');e.textContent='Test Google Drive in corso...';const r=await fetch('/api/cloud/test',{method:'POST'});const j=await r.json();e.textContent=(j.ok?'Google Drive OK. ':'Google Drive ERRORE. ')+(j.custom_oauth?'OAuth dedicato configurato. ':'OAuth dedicato NON configurato. ')+(j.detail||'');setTimeout(refresh,1000)}
 async function cleanupOld(){const r=await fetch('/api/maintenance/cleanup',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';setTimeout(refresh,1000)}
 refresh();setInterval(refresh,10000);
 </script></body></html>
@@ -628,6 +727,12 @@ def set_config(cfg: ConfigModel):
         raise HTTPException(400, "jpeg_quality must be 4..30")
     if not 1 <= data["stream_max_fps"] <= 15:
         raise HTTPException(400, "stream_max_fps must be 1..15")
+    if not 0 <= data["cloud_batch_delay_sec"] <= 60:
+        raise HTTPException(400, "cloud_batch_delay_sec must be 0..60")
+    if not 60 <= data["cloud_rate_limit_backoff_sec"] <= 86400:
+        raise HTTPException(400, "cloud_rate_limit_backoff_sec must be 60..86400")
+    if not 1 <= data["cloud_tps_limit"] <= 100:
+        raise HTTPException(400, "cloud_tps_limit must be 1..100")
     for name in ("brightness", "contrast", "saturation"):
         if not -2 <= data[name] <= 2:
             raise HTTPException(400, f"{name} must be -2..2")
@@ -1008,6 +1113,7 @@ def api_status():
         "drive_enabled": cfg.get("drive_enabled", False),
         "pending_cloud": pending,
         "cloud_backoff": backoff,
+        "drive_custom_oauth": has_custom_drive_oauth(str(cfg.get("drive_remote") or "gdrive")),
         "latest_name": latest.name if latest else None,
         "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
     }
@@ -1033,6 +1139,14 @@ def sync_pending(force: bool = False):
 
     queue_cloud_sync(force=True)
     return {"queued": True, "forced": force}
+
+
+@app.post("/api/cloud/test")
+def test_cloud():
+    result = drive_health()
+    if not result["ok"]:
+        record_runtime_error("google_drive_test", result.get("detail", "Google Drive test failed"))
+    return result
 
 
 @app.post("/api/maintenance/cleanup")
