@@ -628,11 +628,12 @@ def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any])
     if exists:
         command = [
             "rclone", "config", "update", remote,
-            "type", "drive",
             "client_id", client_id,
             "client_secret", "",
             "scope", "drive.file",
             "token", rclone_token,
+            "config_refresh_token", "false",
+            "--non-interactive",
         ]
     else:
         command = [
@@ -641,6 +642,8 @@ def configure_rclone_device_token(client_id: str, token_payload: dict[str, Any])
             "client_secret", "",
             "scope", "drive.file",
             "token", rclone_token,
+            "config_refresh_token", "false",
+            "--non-interactive",
         ]
 
     try:
