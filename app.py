@@ -1957,6 +1957,7 @@ def set_camera_mode(mode: str):
         )
 
     cfg = load_config()
+    old_mode = str(cfg.get("camera_mode") or "automatic")
     camera_id = str(cfg.get("camera_id") or "CAM01")
 
     with camera_operation_lock:
@@ -1985,9 +1986,13 @@ def set_camera_mode(mode: str):
 
     applied, message = push_config_to_node(camera_id, cfg)
     if not applied:
+        cfg["camera_mode"] = old_mode
+        save_config(cfg)
+        if old_mode == "streaming":
+            start_streaming_mode(camera_id)
         raise HTTPException(
             503,
-            f"Camera mode saved but node did not apply it: {message}",
+            f"Camera did not apply the requested mode; server mode was restored: {message}",
         )
 
     if normalized == "streaming":
