@@ -124,7 +124,14 @@ th{color:var(--muted);font-weight:600}
           <div id="queueInfo" class="queue"></div>
           <div class="actions">
             <button id="photoButton" onclick="manualCapture()">Foto</button>
-            <button id="recordButton" onclick="recordVideo()">Video</button>
+            <select id="quickVideoDuration" style="width:auto;min-width:130px">
+              <option value="10">10 secondi</option>
+              <option value="30">30 secondi</option>
+              <option value="60">1 minuto</option>
+              <option value="180">3 minuti</option>
+              <option value="600">10 minuti</option>
+            </select>
+            <button id="recordButton" onclick="recordVideo()">Registra video</button>
           </div>
           <div id="actionResult" class="muted" style="margin-top:9px"></div>
         </div>
@@ -179,7 +186,8 @@ th{color:var(--muted);font-weight:600}
           <select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select>
           <label>Qualità JPEG (4 migliore, 30 più compressa)</label><input id="jpeg_quality" type="number" min="4" max="30">
           <label>FPS streaming/video</label><input id="stream_max_fps" type="number" min="1" max="15">
-          <label>Durata video manuale, secondi</label><input id="event_video_sec" type="number" min="1" max="60">
+          <label>Durata video manuale predefinita, secondi</label><input id="event_video_sec" type="number" min="1" max="3600">
+          <div class="muted" style="margin-top:5px">Da 1 secondo a 60 minuti. Gli FPS indicano il massimo richiesto alla camera; la durata viene misurata sull'orologio reale.</div>
           <label>Intervallo automatico foto, secondi</label><input id="snapshot_interval_sec" type="number" min="1">
         </div>
 
@@ -302,8 +310,18 @@ function setModeButtons(mode){
 }
 
 function renderQueue(q){
-  const active=q.active?('#'+q.active.id+' '+q.active.kind+' in esecuzione'):'nessuna operazione in esecuzione';
-  const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
+  let active='nessuna operazione in esecuzione';
+  if(q.active){
+    active='#'+q.active.id+' '+q.active.kind+' in esecuzione';
+    if(q.active.kind==='stream_video'||q.active.kind==='alarm_video'){
+      const pct=Number(q.active.progress_pct||0);
+      const elapsed=Number(q.active.elapsed_sec||0);
+      const remaining=Number(q.active.remaining_sec||0);
+      const fps=Number(q.active.capture_fps||0);
+      active+=' · '+pct+'% · '+fmtDuration(elapsed)+' trascorsi · '+fmtDuration(remaining)+' restanti · '+fps.toFixed(2)+' fps reali';
+    }
+  }
+  const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind+(x.duration?' '+fmtDuration(x.duration):'')).join(' → ');
   const auto=q.mode==='automatic'?'<br>Prossima foto automatica tra '+(q.next_automatic_in_sec??0)+' s':'';
   document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · in attesa '+(q.queue_length||0)+(queued?'<br>'+esc(queued):'')+auto;
 }
@@ -344,7 +362,12 @@ function renderMode(st){
   const streaming=mode==='streaming';
   document.getElementById('photoButton').disabled=!streaming;
   document.getElementById('recordButton').disabled=!streaming;
-  document.getElementById('recordButton').textContent='Video '+(cfg.event_video_sec||10)+' s';
+  const quick=document.getElementById('quickVideoDuration');
+  if(quick&&!Array.from(quick.options).some(o=>Number(o.value)===Number(cfg.event_video_sec||10))){
+    const opt=document.createElement('option');opt.value=String(cfg.event_video_sec||10);opt.textContent=fmtDuration(cfg.event_video_sec||10);quick.appendChild(opt);
+  }
+  if(quick)quick.value=String(cfg.event_video_sec||10);
+  document.getElementById('recordButton').textContent='Registra video';
 
   const liveCard=document.getElementById('liveCard');
   const live=document.getElementById('live');
@@ -464,9 +487,10 @@ async function manualCapture(){
 
 async function recordVideo(){
   const e=document.getElementById('actionResult');
-  const d=cfg.event_video_sec||10;
+  const selector=document.getElementById('quickVideoDuration');
+  const d=Math.max(1,Math.min(3600,parseInt(selector?.value||cfg.event_video_sec||10)));
   const r=await fetch('/api/camera/'+encodeURIComponent(cfg.camera_id)+'/record?duration='+d,{method:'POST'});
-  if(r.ok){const j=await r.json();e.textContent='Video #'+j.operation.id+' ('+d+' s) aggiunto alla coda.'}
+  if(r.ok){const j=await r.json();e.textContent='Video #'+j.operation.id+' ('+fmtDuration(d)+') aggiunto alla coda. La durata è indipendente dagli FPS.'}
   else e.textContent='Errore video: '+await apiErrorText(r);
   setTimeout(refreshQueue,150);
 }
