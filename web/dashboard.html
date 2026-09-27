@@ -119,6 +119,7 @@ th{color:var(--muted);font-weight:600}
 
         <div class="card">
           <h2>Camera</h2>
+          <div id="healthInfo" class="notice muted">Salute camera: caricamento...</div>
           <div id="nodeInfo" class="statusline muted">Caricamento...</div>
           <div id="queueInfo" class="queue"></div>
           <div class="actions">
@@ -258,7 +259,7 @@ th{color:var(--muted);font-weight:600}
         <div class="card full scroll">
           <h2>Telecamere</h2>
           <table>
-            <thead><tr><th>Camera</th><th>Stato</th><th>Installato</th><th>Partizione</th><th>OTA</th><th>Progresso</th><th>Azione</th></tr></thead>
+            <thead><tr><th>Camera</th><th>Stato</th><th>Installato</th><th>Boot</th><th>Reset</th><th>Partizione</th><th>OTA</th><th>Progresso</th><th>Azione</th></tr></thead>
             <tbody id="firmwareCameras"></tbody>
           </table>
         </div>
@@ -284,6 +285,7 @@ let activePage='overview';
 
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
+function fmtDuration(sec){sec=Math.max(0,Number(sec||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=Math.floor(sec%60);return(d?d+'g ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
 function apiErrorText(r){return r.json().then(j=>j.detail||j.error||JSON.stringify(j)).catch(()=>r.text()).catch(()=>'Errore HTTP '+r.status)}
 
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>{
@@ -388,13 +390,23 @@ async function refresh(){
     const n=nodeCache;
     if(n){
       document.getElementById('topOnline').innerHTML=n.online?'<span class="ok">● CAM01 ONLINE</span>':'<span class="bad">● CAM01 OFFLINE</span>';
+      const health=n.health||{level:(n.online?'ok':'error'),label:(n.online?'OK':'ERRORE'),issues:[]};
+      const healthClass=health.level==='ok'?'ok':(health.level==='warning'?'warn':'bad');
+      const healthIssues=(health.issues||[]).map(x=>esc(x.message)).join(' · ');
+      document.getElementById('healthInfo').innerHTML=
+        'Salute camera: <span class="'+healthClass+'"><b>● '+esc(health.label||'')+'</b></span>'+
+        (healthIssues?'<br><span class="muted">'+healthIssues+'</span>':'');
       document.getElementById('nodeInfo').innerHTML=
         'Nodo: <b>'+esc(n.camera_id)+'</b><br>'+
-        'Firmware: '+esc(n.firmware||'')+' · IP '+esc(n.ip||'')+'<br>'+
-        'RSSI: '+esc(n.rssi??'')+' dBm · driver '+esc(n.driver_mode||'')+'<br>'+
+        'Firmware: <b>'+esc(n.firmware||'')+'</b> · Boot #'+esc(n.boot_count??'—')+' · Uptime '+fmtDuration(n.uptime_sec)+'<br>'+
+        'Reset: '+esc(n.reset_reason||'—')+' · Partizione: '+esc(n.ota_partition||'—')+
+        (n.firmware_changed_at_boot?' · <span class="ok">firmware cambiato al boot</span>':'')+'<br>'+
+        'Wi-Fi: '+esc(n.rssi??'')+' dBm · '+esc(n.wifi_quality_pct??'—')+'% · driver '+esc(n.driver_mode||'')+'<br>'+
+        'Heap: '+fmtBytes(n.free_heap)+' · minimo '+fmtBytes(n.min_free_heap)+' · PSRAM '+fmtBytes(n.free_psram)+'<br>'+
         'Motion: '+esc(n.motion_hits??0)+' / '+esc(n.motion_samples??0)+' · Allarmi: '+esc(n.alarm_triggers??0);
     }else{
       document.getElementById('topOnline').innerHTML='<span class="bad">● CAMERA NON PRESENTE</span>';
+      document.getElementById('healthInfo').innerHTML='Salute camera: <span class="bad"><b>● ERRORE</b></span>';
       document.getElementById('nodeInfo').textContent='Nessun heartbeat CamNode.';
     }
 
@@ -569,7 +581,8 @@ async function refreshFirmware(){
       else if(j&&['requested','preparing','downloading','verifying','rebooting','waiting_heartbeat'].includes(j.state))action='<button disabled>Aggiornamento...</button>';
       else action='<button class="primary" onclick="updateCamera('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+')">Aggiorna</button>';
       const err=j?.state==='error'?'<div class="bad">'+esc(j.error||'')+'</div>':'';
-      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+(cam.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+'</td><td>'+esc(cam.firmware||'—')+'</td><td>'+esc(cam.ota_partition||'—')+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
+      const changed=cam.firmware_changed_at_boot&&cam.previous_firmware?'<div class="ok">da '+esc(cam.previous_firmware)+'</div>':'';
+      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+(cam.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
     }).join('');
   }catch(e){
     document.getElementById('firmwareManifest').textContent='Errore lettura stato OTA.';
