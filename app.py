@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+from io import BytesIO
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
+from PIL import Image, ImageDraw
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -36,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.0.1")
+app = FastAPI(title="CamHub", version="1.0.2")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -315,7 +317,164 @@ def make_filename(camera: str, event_type: str, dt: datetime, suffix: str) -> st
     return f"{camera}_{safe_event}_{dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]}{suffix}"
 
 
-def register_media(path: Path, camera: str, event_type: str, captured_at: datetime, source: str) -> dict[str, Any]:
+ACQUISITION_MARKERS = {
+    "automatic": {
+        "color": "#2F80ED",
+        "rgb": (47, 128, 237),
+        "label": "Automatico",
+    },
+    "streaming": {
+        "color": "#27AE60",
+        "rgb": (39, 174, 96),
+        "label": "Streaming / manuale",
+    },
+    "alarm": {
+        "color": "#EB5757",
+        "rgb": (235, 87, 87),
+        "label": "Allarme",
+    },
+}
+
+
+def acquisition_mode_for_event(event_type: str) -> str | None:
+    event = str(event_type or "").strip().lower()
+    if event in {"periodic", "automatic", "auto"} or event.startswith("periodic"):
+        return "automatic"
+    if event == "alarm" or event.startswith("alarm_"):
+        return "alarm"
+    if (
+        event in {"manual", "streaming", "snapshot"}
+        or event.startswith("manual")
+        or event.startswith("stream_")
+    ):
+        return "streaming"
+    return None
+
+
+def mark_acquired_jpeg(
+    payload: bytes,
+    event_type: str,
+) -> tuple[bytes, dict[str, Any]]:
+    """
+    Burn a small acquisition-mode dot into the archived JPEG.
+
+    This happens before the archived file SHA-256 is calculated, therefore
+    the visible marker is part of the stored evidence file rather than a
+    dashboard overlay. The SHA-256 of the incoming unmarked JPEG is also
+    retained in the manifest for provenance.
+    """
+    raw_sha256 = hashlib.sha256(payload).hexdigest()
+    mode = acquisition_mode_for_event(event_type)
+
+    if mode is None:
+        return payload, {
+            "acquisition_mode": "unmarked",
+            "marker": None,
+            "source_sha256_before_marker": raw_sha256,
+        }
+
+    marker = ACQUISITION_MARKERS[mode]
+
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            image.load()
+
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            elif image.mode == "L":
+                image = image.convert("RGB")
+
+            width, height = image.size
+            radius = max(4, min(width, height) // 160)
+            margin = max(8, radius * 2)
+            center_x = max(radius + 1, width - margin)
+            center_y = margin
+            box = (
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+            )
+
+            draw = ImageDraw.Draw(image)
+            outline_width = max(1, radius // 4)
+            draw.ellipse(
+                box,
+                fill=marker["rgb"],
+                outline=(12, 12, 12),
+                width=outline_width,
+            )
+
+            output = BytesIO()
+            save_args: dict[str, Any] = {
+                "format": "JPEG",
+                "quality": "keep",
+                "subsampling": "keep",
+                "optimize": False,
+            }
+
+            if image.info.get("exif"):
+                save_args["exif"] = image.info["exif"]
+            if image.info.get("icc_profile"):
+                save_args["icc_profile"] = image.info["icc_profile"]
+
+            image.save(output, **save_args)
+            marked = output.getvalue()
+
+        return marked, {
+            "acquisition_mode": mode,
+            "marker": {
+                "kind": "dot",
+                "position": "top-right",
+                "color": marker["color"],
+                "label": marker["label"],
+                "radius_px": radius,
+            },
+            "source_sha256_before_marker": raw_sha256,
+            "source_size_before_marker": len(payload),
+        }
+
+    except Exception as exc:
+        record_runtime_error(
+            "camhub_marker",
+            f"Image marker failed for event {event_type}: {exc}",
+            category="image_marker",
+        )
+        return payload, {
+            "acquisition_mode": mode,
+            "marker": {
+                "kind": "dot",
+                "position": "top-right",
+                "color": marker["color"],
+                "label": marker["label"],
+                "applied": False,
+            },
+            "source_sha256_before_marker": raw_sha256,
+            "source_size_before_marker": len(payload),
+            "marker_error": str(exc),
+        }
+
+
+def write_acquired_jpeg(
+    path: Path,
+    payload: bytes,
+    event_type: str,
+) -> dict[str, Any]:
+    marked_payload, provenance = mark_acquired_jpeg(payload, event_type)
+    path.write_bytes(marked_payload)
+    provenance["marker_applied"] = marked_payload != payload
+    provenance["stored_size_after_marker"] = len(marked_payload)
+    return provenance
+
+
+def register_media(
+    path: Path,
+    camera: str,
+    event_type: str,
+    captured_at: datetime,
+    source: str,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     cfg = load_config()
     suffix = path.suffix.lower()
     media_type = "video" if suffix == ".mp4" else ("error" if suffix == ".txt" else "image")
@@ -331,6 +490,8 @@ def register_media(path: Path, camera: str, event_type: str, captured_at: dateti
         "media_type": media_type,
         "cloud_status": "PENDING" if cfg.get("drive_enabled") else "DISABLED",
     }
+    if extra_metadata:
+        data.update(extra_metadata)
     write_metadata(path, data)
     if cfg.get("drive_enabled"):
         queue_cloud_sync()
@@ -971,13 +1132,18 @@ def _direct_camera_photo(camera_id: str, event_type: str) -> dict[str, Any]:
                 dt,
                 ".jpg",
             )
-            out_path.write_bytes(payload)
+            provenance = write_acquired_jpeg(
+                out_path,
+                payload,
+                event_type,
+            )
             meta = register_media(
                 out_path,
                 camera_id,
                 event_type,
                 dt,
                 "exclusive_direct_capture",
+                provenance,
             )
             return {
                 "file": out_path.name,
@@ -1029,13 +1195,18 @@ def _streaming_photo(camera_id: str) -> dict[str, Any]:
         dt,
         ".jpg",
     )
-    out_path.write_bytes(payload)
+    provenance = write_acquired_jpeg(
+        out_path,
+        payload,
+        "manual",
+    )
     meta = register_media(
         out_path,
         camera_id,
         "manual",
         dt,
         "shared_stream",
+        provenance,
     )
     return {
         "file": out_path.name,
@@ -2643,9 +2814,18 @@ async def upload_image(
     camera = camera_id or cfg["camera_id"]
     dt = now_local()
     out_path = camera_day_dir(camera, dt) / make_filename(camera, event_type, dt, ".jpg")
-    with out_path.open("wb") as output:
-        shutil.copyfileobj(file.file, output)
-    register_media(out_path, camera, event_type, dt, "multipart")
+    payload = file.file.read()
+    if not payload:
+        raise HTTPException(400, "Empty image upload")
+    provenance = write_acquired_jpeg(out_path, payload, event_type)
+    register_media(
+        out_path,
+        camera,
+        event_type,
+        dt,
+        "multipart",
+        provenance,
+    )
     return {"ok": True, "file": out_path.name, "relative": out_path.relative_to(DATA_DIR).as_posix()}
 
 
@@ -2669,9 +2849,20 @@ async def upload_raw_image(
     camera = camera_id or cfg["camera_id"]
     dt = now_local()
     out_path = camera_day_dir(camera, dt) / make_filename(camera, event_type, dt, ".jpg")
-    out_path.write_bytes(payload)
+    provenance = write_acquired_jpeg(
+        out_path,
+        payload,
+        event_type,
+    )
     source = "alarm_node_upload" if event_type == "alarm" else "raw_jpeg"
-    meta = register_media(out_path, camera, event_type, dt, source)
+    meta = register_media(
+        out_path,
+        camera,
+        event_type,
+        dt,
+        source,
+        provenance,
+    )
     return {"ok": True, "file": out_path.name, "relative": out_path.relative_to(DATA_DIR).as_posix(), "size": len(payload), "sha256": meta["sha256"]}
 
 
