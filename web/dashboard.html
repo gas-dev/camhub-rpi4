@@ -50,7 +50,7 @@ a{color:var(--accent)}
 .card.third{grid-column:span 4}
 .card h2{font-size:17px;margin:0 0 12px}
 .card h3{font-size:14px;margin:14px 0 8px;color:#cbd5e1}
-.mode-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.mode-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 .mode{padding:14px;text-align:left;min-height:92px}
 .mode b{display:block;margin-bottom:5px}
 .mode.active{outline:2px solid var(--accent);background:#18324a}
@@ -104,6 +104,7 @@ th{color:var(--muted);font-weight:600}
         <div class="card full">
           <h2>Modalità</h2>
           <div class="mode-row">
+            <button id="modeStandby" class="mode" onclick="setMode('standby')"><b>Standby</b><span class="muted">Solo rete, heartbeat, comandi e OTA. Driver camera spento.</span></button>
             <button id="modeAutomatic" class="mode" onclick="setMode('automatic')"><b>Automatico</b><span class="muted">Una foto all'intervallo impostato, nessuno stream continuo.</span></button>
             <button id="modeStreaming" class="mode" onclick="setMode('streaming')"><b>Streaming</b><span class="muted">Un solo flusso condiviso per live, foto e video.</span></button>
             <button id="modeAlarm" class="mode" onclick="setMode('alarm')"><b>Allarme</b><span class="muted">Motion detection locale; foto + video solo su evento.</span></button>
@@ -306,6 +307,7 @@ document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',(
 }));
 
 function setModeButtons(mode){
+  document.getElementById('modeStandby').classList.toggle('active',mode==='standby');
   document.getElementById('modeAutomatic').classList.toggle('active',mode==='automatic');
   document.getElementById('modeStreaming').classList.toggle('active',mode==='streaming');
   document.getElementById('modeAlarm').classList.toggle('active',mode==='alarm');
@@ -366,9 +368,9 @@ function renderErrors(summary){
 function renderMode(st){
   const mode=cfg.camera_mode||'automatic';
   setModeButtons(mode);
-  const streaming=mode==='streaming';
-  document.getElementById('photoButton').disabled=!streaming;
-  document.getElementById('recordButton').disabled=!streaming;
+  const streamingReady=mode==='streaming'&&nodeCache&&String(nodeCache.active_mode||nodeCache.mode||'')==='streaming'&&String(nodeCache.state||'')==='ready'&&!!nodeCache.camera_ready;
+  document.getElementById('photoButton').disabled=!streamingReady;
+  document.getElementById('recordButton').disabled=!streamingReady;
   const quick=document.getElementById('quickVideoDuration');
   if(quick&&!Array.from(quick.options).some(o=>Number(o.value)===Number(cfg.event_video_sec||10))){
     const opt=document.createElement('option');opt.value=String(cfg.event_video_sec||10);opt.textContent=fmtDuration(cfg.event_video_sec||10);quick.appendChild(opt);
@@ -381,7 +383,7 @@ function renderMode(st){
 
   const liveCard=document.getElementById('liveCard');
   const live=document.getElementById('live');
-  if(streaming){
+  if(streamingReady){
     liveCard.style.display='block';
     const wanted='/api/camera/'+encodeURIComponent(cfg.camera_id)+'/live';
     if(!live.src.includes(wanted))live.src=wanted+'?t='+Date.now();
@@ -391,9 +393,13 @@ function renderMode(st){
   }
 
   let text='';
+  if(mode==='standby')text='<span class="ok"><b>STANDBY</b></span> · nodo collegato, driver camera spento, pronto per comandi/OTA';
   if(mode==='automatic')text='<span class="ok"><b>AUTOMATICO</b></span> · una foto ogni '+cfg.snapshot_interval_sec+' secondi';
   if(mode==='streaming')text='<span class="ok"><b>STREAMING</b></span> · un solo flusso condiviso per live, foto e video';
   if(mode==='alarm')text='<span class="ok"><b>ALLARME</b></span> · rilevamento locale · foto + video '+cfg.alarm_video_sec+' s su movimento';
+  if(nodeCache&&nodeCache.state&&String(nodeCache.active_mode||nodeCache.mode||'')!==mode){
+    text+='<br><span class="warn">Transizione: nodo '+esc(nodeCache.state)+' · attiva '+esc(nodeCache.active_mode||nodeCache.mode||'—')+'</span>';
+  }
   document.getElementById('modeResult').innerHTML=text;
   renderQueue(st.camera_queue||{});
 }
@@ -429,22 +435,26 @@ async function refresh(){
       document.getElementById('healthInfo').innerHTML=
         'Salute camera: <span class="'+healthClass+'"><b>● '+esc(health.label||'')+'</b></span>'+
         (healthIssues?'<br><span class="muted">'+healthIssues+'</span>':'');
+      const nodeState=String(n.state||'legacy');
+      const desired=String(n.desired_mode||cfg.camera_mode||'—');
+      const active=String(n.active_mode||n.mode||'—');
+      const cameraReady=n.camera_ready===true;
+      const driverOn=n.camera_driver_on===true;
+      const latestAge=Number(n.latest_frame_age_ms??-1);
+      const stateClass=nodeState==='error'?'bad':(['recovering','transition','booting','ota'].includes(nodeState)?'warn':'ok');
+      document.getElementById('topOnline').innerHTML=n.online?'<span class="'+stateClass+'">● CAM01 '+esc(nodeState.toUpperCase())+'</span>':'<span class="bad">● CAM01 OFFLINE</span>';
       document.getElementById('nodeInfo').innerHTML=
         'Nodo: <b>'+esc(n.camera_id)+'</b><br>'+
         'Firmware: <b>'+esc(n.firmware||'')+'</b> · Boot #'+esc(n.boot_count??'—')+' · Uptime '+fmtDuration(n.uptime_sec)+'<br>'+
-        'Reset: '+esc(n.reset_reason||'—')+' · Partizione: '+esc(n.ota_partition||'—')+
-        (n.firmware_changed_at_boot?' · <span class="ok">firmware cambiato al boot</span>':'')+
-        (n.health_baseline_initialized===false?' · <span class="muted">baseline diagnostica inizializzata</span>':'')+'<br>'+
-        'Wi-Fi: '+esc(n.rssi??'')+' dBm · '+esc(n.wifi_quality_pct??'—')+'% · driver '+esc(n.driver_mode||'')+'<br>'+
-        'Heap: '+fmtBytes(n.free_heap)+' · minimo '+fmtBytes(n.min_free_heap)+' · PSRAM '+fmtBytes(n.free_psram)+'<br>'+
-        'Pipeline: '+(n.camera_pipeline_healthy===false?'<span class="bad"><b>RECOVERY</b></span>':'<span class="ok">OK</span>')+
-        ' · Dropout '+esc(n.stream_frame_dropouts??0)+
-        ' · recuperati '+esc(n.stream_recovered_dropouts??0)+
-        ' · fatal '+esc(n.stream_fatal_failures??0)+'<br>'+
-        'Power-cycle sensore: '+esc(n.sensor_power_cycles??0)+
-        ' · riparazioni background '+esc(n.background_repairs??0)+
-        ' · fallite '+esc(n.background_repair_failures??0)+'<br>'+
-        'Motion: '+esc(n.motion_hits??0)+' / '+esc(n.motion_samples??0)+' · Allarmi: '+esc(n.alarm_triggers??0);
+        'Stato: <b class="'+stateClass+'">'+esc(nodeState.toUpperCase())+'</b> · desiderata <b>'+esc(desired)+'</b> · attiva <b>'+esc(active)+'</b><br>'+
+        'Driver camera: '+(driverOn?'<span class="ok">ON</span>':'OFF')+' · pipeline: '+(cameraReady?'<span class="ok">READY</span>':(active==='standby'?'<span class="muted">SPENTA</span>':'<span class="warn">NON PRONTA</span>'))+'<br>'+
+        'Ultimo frame: '+(latestAge>=0?latestAge+' ms fa':'—')+' · seq '+esc(n.latest_frame_seq??0)+' · stream Raspberry '+(n.stream_frame_available?'<span class="ok">FRAME OK</span>':'nessun frame')+'<br>'+
+        'Frame camera: '+esc(n.frame_capture_success??n.capture_success??0)+' / '+esc(n.frame_capture_attempts??n.capture_requests??0)+' · falliti '+esc(n.frame_capture_failures??n.camera_fb_get_failures??0)+'<br>'+
+        'Recovery: '+esc(n.camera_recoveries??n.driver_recoveries??0)+' · falliti '+esc(n.camera_recovery_failures??n.driver_recovery_failures??0)+' · power-cycle '+esc(n.sensor_power_cycles??0)+'<br>'+
+        'Config rev: desiderata '+esc(n.config_revision_desired??'—')+' · attiva '+esc(n.config_revision_active??'—')+'<br>'+
+        'Wi-Fi: '+esc(n.rssi??'')+' dBm · '+esc(n.wifi_quality_pct??'—')+'% · heap '+fmtBytes(n.free_heap)+' · minimo '+fmtBytes(n.min_free_heap)+' · PSRAM '+fmtBytes(n.free_psram)+
+        (n.last_error_message?'<br><span class="bad">Ultimo errore ['+esc(n.last_error_code||'')+']: '+esc(n.last_error_message)+'</span>':'')+'<br>'+
+        'Motion: '+esc(n.motion_hits??0)+' / '+esc(n.motion_samples??0)+' · variazione '+esc(n.motion_changed_pct??0)+'% · Allarmi: '+esc(n.alarm_triggers??0);
     }else{
       document.getElementById('topOnline').innerHTML='<span class="bad">● CAMERA NON PRESENTE</span>';
       document.getElementById('healthInfo').innerHTML='Salute camera: <span class="bad"><b>● ERRORE</b></span>';
@@ -612,7 +622,7 @@ async function uploadFirmware(){
 
 function otaStateLabel(job){
   if(!job)return 'Pronta';
-  const map={requested:'Richiesta',preparing:'Preparazione',downloading:'Download',verifying:'Verifica SHA-256',rebooting:'Riavvio',waiting_heartbeat:'Attesa heartbeat',completed:'Completato',error:'Errore'};
+  const map={entering_standby:'Ingresso Standby',requested:'Richiesta',preparing:'Preparazione',downloading:'Download',verifying:'Verifica SHA-256',rebooting:'Riavvio',waiting_heartbeat:'Attesa heartbeat',restoring_mode:'Ripristino modalità',completed:'Completato',error:'Errore'};
   return map[job.state]||job.state||'—';
 }
 
