@@ -400,7 +400,8 @@ async function refresh(){
         'Nodo: <b>'+esc(n.camera_id)+'</b><br>'+
         'Firmware: <b>'+esc(n.firmware||'')+'</b> · Boot #'+esc(n.boot_count??'—')+' · Uptime '+fmtDuration(n.uptime_sec)+'<br>'+
         'Reset: '+esc(n.reset_reason||'—')+' · Partizione: '+esc(n.ota_partition||'—')+
-        (n.firmware_changed_at_boot?' · <span class="ok">firmware cambiato al boot</span>':'')+'<br>'+
+        (n.firmware_changed_at_boot?' · <span class="ok">firmware cambiato al boot</span>':'')+
+        (n.health_baseline_initialized===false?' · <span class="muted">baseline diagnostica inizializzata</span>':'')+'<br>'+
         'Wi-Fi: '+esc(n.rssi??'')+' dBm · '+esc(n.wifi_quality_pct??'—')+'% · driver '+esc(n.driver_mode||'')+'<br>'+
         'Heap: '+fmtBytes(n.free_heap)+' · minimo '+fmtBytes(n.min_free_heap)+' · PSRAM '+fmtBytes(n.free_psram)+'<br>'+
         'Motion: '+esc(n.motion_hits??0)+' / '+esc(n.motion_samples??0)+' · Allarmi: '+esc(n.alarm_triggers??0);
@@ -581,8 +582,9 @@ async function refreshFirmware(){
       else if(j&&['requested','preparing','downloading','verifying','rebooting','waiting_heartbeat'].includes(j.state))action='<button disabled>Aggiornamento...</button>';
       else action='<button class="primary" onclick="updateCamera('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+')">Aggiorna</button>';
       const err=j?.state==='error'?'<div class="bad">'+esc(j.error||'')+'</div>':'';
-      const changed=cam.firmware_changed_at_boot&&cam.previous_firmware?'<div class="ok">da '+esc(cam.previous_firmware)+'</div>':'';
-      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+(cam.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
+      const changed=cam.firmware_changed_at_boot&&cam.previous_firmware?'<div class="ok">da '+esc(cam.previous_firmware)+'</div>':(cam.health_baseline_initialized===false?'<div class="muted">baseline nuova</div>':'');
+      const slotTransition=j&&j.state==='completed'&&j.source_partition&&cam.ota_partition&&j.source_partition!==cam.ota_partition?'<div class="ok">'+esc(j.source_partition)+' → '+esc(cam.ota_partition)+'</div>':'';
+      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+(cam.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
     }).join('');
   }catch(e){
     document.getElementById('firmwareManifest').textContent='Errore lettura stato OTA.';
