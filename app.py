@@ -4377,6 +4377,21 @@ def set_camera_mode(mode: str):
         or "CAM01"
     )
 
+    node = get_node(camera_id)
+    installed = str(
+        (node or {}).get("firmware")
+        or ""
+    )
+
+    if normalized == "standby" and installed.startswith("0."):
+        raise HTTPException(
+            409,
+            (
+                "Standby is available from CamNode 1.0.0. "
+                "Upgrade this legacy 0.8.x camera first."
+            ),
+        )
+
     if ota_camera_busy(camera_id):
         raise HTTPException(
             409,
