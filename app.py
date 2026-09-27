@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.1.0")
+app = FastAPI(title="CamHub", version="1.1.1")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -956,52 +956,118 @@ def clear_stream_frame(camera_id: str) -> None:
 
 
 def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
+    reconnect_failures = 0
+    outage_started: float | None = None
+    last_report_at = 0.0
+
     try:
-        node = get_node(camera_id)
-        stream_url = str((node or {}).get("stream_url") or "")
-        if not stream_url:
-            raise RuntimeError("Camera stream URL unavailable")
+        while not stop_event.is_set():
+            if load_config().get("camera_mode") != "streaming":
+                break
 
-        request = urllib.request.Request(
-            stream_url,
-            headers={"User-Agent": "CamHub/0.9-stream", "Connection": "close"},
-        )
+            node = get_node(camera_id)
+            stream_url = str((node or {}).get("stream_url") or "")
+            if not stream_url:
+                reconnect_failures += 1
+                if outage_started is None:
+                    outage_started = time.monotonic()
+                time.sleep(min(3.0, 0.5 * reconnect_failures))
+                continue
 
-        with urllib.request.urlopen(request, timeout=15) as response:
-            buffer = b""
+            request = urllib.request.Request(
+                stream_url,
+                headers={
+                    "User-Agent": "CamHub/1.1.1-stream",
+                    "Connection": "close",
+                },
+            )
 
-            while not stop_event.is_set():
-                if load_config().get("camera_mode") != "streaming":
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    buffer = b""
+                    received_frame_this_connection = False
+
+                    while not stop_event.is_set():
+                        if load_config().get("camera_mode") != "streaming":
+                            break
+
+                        chunk = response.read(8192)
+                        if not chunk:
+                            raise ConnectionError(
+                                "MJPEG stream closed by camera"
+                            )
+
+                        buffer += chunk
+
+                        while True:
+                            start = buffer.find(b"\xff\xd8")
+                            if start < 0:
+                                if len(buffer) > 2:
+                                    buffer = buffer[-2:]
+                                break
+
+                            end = buffer.find(b"\xff\xd9", start + 2)
+                            if end < 0:
+                                if start > 0:
+                                    buffer = buffer[start:]
+                                if len(buffer) > 8 * 1024 * 1024:
+                                    buffer = b""
+                                break
+
+                            frame = buffer[start:end + 2]
+                            buffer = buffer[end + 2:]
+
+                            if len(frame) <= 1024:
+                                continue
+
+                            set_stream_frame(camera_id, frame)
+                            received_frame_this_connection = True
+
+                            # A valid frame proves that the link recovered.
+                            reconnect_failures = 0
+                            outage_started = None
+
+            except Exception as exc:
+                if (
+                    stop_event.is_set()
+                    or load_config().get("camera_mode") != "streaming"
+                ):
                     break
 
-                chunk = response.read(8192)
-                if not chunk:
-                    break
-                buffer += chunk
+                reconnect_failures += 1
+                now_mono = time.monotonic()
+                if outage_started is None:
+                    outage_started = now_mono
 
-                while True:
-                    start = buffer.find(b"\xff\xd8")
-                    if start < 0:
-                        if len(buffer) > 2:
-                            buffer = buffer[-2:]
-                        break
+                outage_sec = now_mono - outage_started
 
-                    end = buffer.find(b"\xff\xd9", start + 2)
-                    if end < 0:
-                        if start > 0:
-                            buffer = buffer[start:]
-                        if len(buffer) > 8 * 1024 * 1024:
-                            buffer = b""
-                        break
+                # Connection loss is self-healed. Only surface it when it
+                # becomes a real outage rather than logging every reconnect.
+                if (
+                    outage_sec >= 12.0
+                    and now_mono - last_report_at >= 60.0
+                ):
+                    record_runtime_error(
+                        "streaming_mode",
+                        (
+                            f"MJPEG unavailable for {outage_sec:.1f}s; "
+                            f"automatic reconnect attempt "
+                            f"{reconnect_failures}: {exc}"
+                        ),
+                        camera_id,
+                        "stream_reconnect",
+                    )
+                    last_report_at = now_mono
 
-                    frame = buffer[start:end + 2]
-                    buffer = buffer[end + 2:]
-                    if len(frame) > 1024:
-                        set_stream_frame(camera_id, frame)
+                clear_stream_frame(camera_id)
 
-    except Exception as exc:
-        if not stop_event.is_set() and load_config().get("camera_mode") == "streaming":
-            record_runtime_error("streaming_mode", str(exc), camera_id)
+                # Fast first retry, then bounded backoff. The camera firmware
+                # also self-recovers its framebuffer pipeline.
+                delay = min(5.0, 0.35 * reconnect_failures)
+                if received_frame_this_connection:
+                    delay = min(delay, 0.75)
+                stop_event.wait(delay)
+
     finally:
         clear_stream_frame(camera_id)
         with stream_thread_lock:
