@@ -3215,6 +3215,9 @@ def ota_status():
                 "health": camera_health({**node, "online": online}),
                 "ota_capable": bool(node.get("ota_capable")),
                 "ota_partition": node.get("ota_partition"),
+                "service_ready": node.get("service_ready"),
+                "startup_grace_remaining_ms": node.get("startup_grace_remaining_ms"),
+                "reboot_capable": bool(node.get("reboot_url")),
                 "job": job,
             })
         except Exception:
@@ -3254,6 +3257,12 @@ def ota_apply(camera_id: str):
             "camera_id": camera_id,
             "version": installed,
         }
+
+    if node.get("service_ready") is False:
+        raise HTTPException(
+            409,
+            "Camera is still stabilizing after startup; wait until it is ready",
+        )
 
     if not bool(node.get("ota_capable")):
         raise HTTPException(
