@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.0.3
+## Current version: 1.1.0
 
 Architecture:
 
@@ -551,3 +551,54 @@ CamHub stores source_version and source_partition when the OTA starts. After the
     -> target 0.8.1 / ota_1
 
 Subsequent firmware versions can additionally verify previous_firmware and an incremented persistent boot_count.
+
+
+## CamHub 1.1.0 wall-clock video recording
+
+Video duration is now independent from the requested camera FPS.
+
+The old streaming recorder fed JPEG frames to FFmpeg with the configured FPS as the input framerate. If the ESP32 was configured for 15 FPS but could physically deliver only about 3 FPS at the selected resolution/quality, ten seconds of captured wall-clock time could become roughly two seconds of playback.
+
+The new model uses wall-clock capture duration:
+
+    start monotonic clock
+    -> collect every unique JPEG frame received during N real seconds
+    -> store frames in one temporary MJPEG spool file
+    -> measure actual average FPS = captured_frames / real_elapsed_seconds
+    -> encode the MP4 using the measured FPS
+    -> ffprobe the final MP4 duration
+    -> store timing diagnostics in the manifest
+    -> delete the temporary MJPEG spool
+
+The configured stream_max_fps is therefore only a camera/source ceiling. It no longer defines MP4 playback speed.
+
+Manifest fields now include:
+
+    requested_duration_sec
+    capture_duration_sec
+    encoded_duration_sec
+    duration_error_sec
+    requested_fps_ceiling
+    measured_capture_fps
+    captured_frames
+    captured_mjpeg_bytes
+    timing_model
+    stopped_early
+
+Manual recordings support 1 second through 3600 seconds (60 minutes).
+
+Dashboard quick presets:
+
+    10 seconds
+    30 seconds
+    1 minute
+    3 minutes
+    10 minutes
+
+During a long recording the queue displays elapsed time, remaining time, percentage, measured FPS and recording/encoding phase.
+
+A Stop video control terminates manual capture early and saves the portion already acquired.
+
+Long recordings use one temporary .mjpg spool instead of thousands of individual temporary JPEG files. CamHub estimates the required working disk space during the first seconds and aborts early if there is insufficient space. Stale temporary spool files are removed automatically on CamHub restart.
+
+Alarm recordings use the same measured-FPS timing model and support up to 10 minutes when paired with CamNode 0.8.1 or later.
