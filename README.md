@@ -2,37 +2,38 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.1.4
+## Current version: 2.0.0
 
-Architecture:
+CamHub 2.x uses an acknowledged state-machine protocol with CamNode 1.x. The complete contract is in `CAMERA_ARCHITECTURE_V2.md`.
 
-    ESP32-CAM -> one MJPEG stream -> Raspberry Pi 4 -> live fan-out / recording / archive -> Google Drive
+Core flow:
 
-CamHub now keeps a single stream from each ESP32-CAM and redistributes the latest frames locally. This avoids opening competing long-lived streams against the camera.
+    CamHub command
+        -> CamNode returns ACCEPTED
+        -> CamNode cameraTask performs transition
+        -> heartbeat confirms active_mode + state
+        -> CamHub considers the command complete
 
-Current functions:
+The four modes are Standby, Automatic, Streaming and Alarm.
 
-- high-resolution live view through the Raspberry Pi
-- live view remains visible while recording
-- manual still capture from the current live frame
-- video recording from 1 to 15 FPS
-- video keeps the currently selected camera resolution
-- configurable VGA / SVGA / XGA / HD / SXGA / UXGA
-- configurable JPEG quality
-- horizontal mirror and vertical flip control
-- brightness, contrast and saturation control
-- configurable periodic snapshots
-- camera heartbeat and online/offline state
-- observed source FPS shown in the dashboard
-- H.264 MP4 generation with FFmpeg
-- SHA-256 for every archived photo and video
-- JSON sidecar metadata
-- batched Google Drive synchronization
-- local retention cleanup
+Streaming uses one authenticated MJPEG connection from CamNode to Raspberry. Browser live, manual photos and manual video reuse the Raspberry frame cache.
+
+Automatic capture is command based: CamHub sends a short capture command and CamNode uploads the resulting JPEG. There is no synchronous long-running /capture request.
+
+OTA for CamNode 1.x always uses:
+
+    current mode
+    -> confirmed Standby
+    -> OTA
+    -> reboot/new firmware heartbeat
+    -> restore previous mode
+    -> confirmed completion
+
+The one-time 0.8.x -> 1.x migration is handled as a compatibility exception because legacy firmware does not implement Standby.
 
 ## Important FPS behavior
 
-The selected FPS is the output video rate, up to 15 FPS.
+The selected FPS is the maximum requested capture rate. MP4 duration is based on real wall-clock capture time and measured received FPS, so playback duration does not shrink when the ESP32 physically delivers fewer frames.
 
 The camera remains at the selected resolution during recording. CamHub never lowers the resolution automatically.
 
