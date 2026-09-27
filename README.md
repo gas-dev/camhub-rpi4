@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.8.0
+## Current version: 0.9.0
 
 Architecture:
 
@@ -354,3 +354,46 @@ Still capture retries transient 409/423/429/503 or connection failures up to thr
 The dashboard shows mode, active item, FIFO queue, and automatic countdown. Queue state refreshes every second.
 
 This architecture intentionally removes the old continuous-live cache path because it was competing with direct still capture on constrained ESP32-CAM hardware.
+
+
+## Three camera modes
+
+CamHub 0.9.0 uses three isolated camera operating modes.
+
+Automatico
+
+    No persistent video stream.
+    CamHub queues one exclusive still image at snapshot_interval_sec.
+    Default interval is 60 seconds.
+
+Streaming
+
+    Exactly one MJPEG connection is kept open from the ESP32 to the Raspberry.
+    The browser live view, manual still images and manual video all reuse this same shared stream.
+    A manual photo saves the latest shared frame; it does not call /capture.
+    A manual video feeds the shared JPEG frames directly to FFmpeg through stdin; it does not open a second ESP32 stream and does not create a temporary JPEG sequence.
+    Multiple manual requests are still processed in FIFO order.
+
+Allarme
+
+    No continuous video is sent to the Raspberry while armed.
+    The ESP32 performs local QVGA grayscale motion detection.
+    Two consecutive motion-positive samples are required before triggering.
+    Global brightness changes are compensated before the changed-pixel percentage is evaluated.
+    On trigger, the ESP32:
+      1. switches from local grayscale detection to the configured JPEG resolution/quality;
+      2. captures and uploads one alarm JPEG;
+      3. notifies CamHub;
+      4. CamHub queues an alarm video, default 10 seconds;
+      5. the ESP32 remains in JPEG mode while CamHub records the video;
+      6. after video/cooldown, the ESP32 returns to local motion detection.
+
+Alarm configuration fields:
+
+    alarm_video_sec
+    motion_threshold_pct
+    motion_pixel_delta
+    motion_sample_ms
+    motion_cooldown_sec
+
+The alarm image is stored with event_type=alarm. The alarm video is stored with an alarm_video_<N>s event type. Both use the normal SHA-256, manifest and cloud-sync path.
