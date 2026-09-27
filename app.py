@@ -2565,8 +2565,8 @@ def set_config(cfg: ConfigModel):
         raise HTTPException(400, "camera_mode must be automatic, streaming or alarm")
     if not 1 <= data["event_video_sec"] <= 3600:
         raise HTTPException(400, "event_video_sec must be 1..3600")
-    if not 1 <= data["alarm_video_sec"] <= 60:
-        raise HTTPException(400, "alarm_video_sec must be 1..60")
+    if not 1 <= data["alarm_video_sec"] <= 600:
+        raise HTTPException(400, "alarm_video_sec must be 1..600")
     if not 1 <= data["motion_threshold_pct"] <= 80:
         raise HTTPException(400, "motion_threshold_pct must be 1..80")
     if not 5 <= data["motion_pixel_delta"] <= 100:
@@ -2706,7 +2706,7 @@ async def node_alarm(
         1,
         min(
             int(payload.get("video_sec") or cfg.get("alarm_video_sec", 10)),
-            60,
+            600,
         ),
     )
 
