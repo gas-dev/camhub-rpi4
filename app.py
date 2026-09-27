@@ -1904,6 +1904,377 @@ async def node_alarm(
     }
 
 
+
+@app.post("/api/ota/upload")
+async def ota_upload(
+    file: UploadFile = File(...),
+    version: str = "",
+):
+    clean_version = "".join(
+        ch for ch in version.strip()
+        if ch.isalnum() or ch in "._-"
+    )[:31]
+
+    if not clean_version:
+        raise HTTPException(400, "Firmware version is required")
+
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".bin"):
+        raise HTTPException(400, "Upload a PlatformIO firmware.bin file")
+
+    temp_path = FIRMWARE_DIR / "camnode-upload.tmp"
+    digest = hashlib.sha256()
+    total = 0
+    first_byte: bytes | None = None
+
+    try:
+        with temp_path.open("wb") as output:
+            while True:
+                chunk = await file.read(64 * 1024)
+                if not chunk:
+                    break
+
+                if first_byte is None:
+                    first_byte = chunk[:1]
+
+                total += len(chunk)
+                if total >= OTA_SLOT_SIZE:
+                    raise HTTPException(
+                        413,
+                        (
+                            f"Firmware is too large for the OTA slot "
+                            f"({OTA_SLOT_SIZE} bytes)"
+                        ),
+                    )
+
+                digest.update(chunk)
+                output.write(chunk)
+
+        if total < 64 * 1024:
+            raise HTTPException(400, "Firmware file is unexpectedly small")
+
+        if first_byte != b"\xE9":
+            raise HTTPException(
+                400,
+                "File does not look like an ESP32 application image",
+            )
+
+        sha256 = digest.hexdigest()
+        uploaded_at = now_local().isoformat()
+
+        archive_name = (
+            f"camnode-{clean_version}-{sha256[:12]}.bin"
+        )
+        archive_path = FIRMWARE_DIR / "archive" / archive_name
+        shutil.copy2(temp_path, archive_path)
+        temp_path.replace(OTA_FIRMWARE_PATH)
+
+        manifest = {
+            "product": "CamNode ESP32-CAM",
+            "version": clean_version,
+            "sha256": sha256,
+            "size": total,
+            "uploaded_at": uploaded_at,
+            "filename": archive_name,
+            "ota_slot_size": OTA_SLOT_SIZE,
+        }
+
+        manifest_tmp = OTA_MANIFEST_PATH.with_suffix(".tmp")
+        manifest_tmp.write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+        manifest_tmp.replace(OTA_MANIFEST_PATH)
+
+        return {
+            "ok": True,
+            "manifest": manifest,
+        }
+
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+@app.get("/api/ota/firmware.bin")
+def ota_firmware_download(
+    x_cam_token: str | None = Header(default=None),
+):
+    cfg = load_config()
+    if x_cam_token != cfg["upload_token"]:
+        raise HTTPException(401, "Invalid camera token")
+
+    manifest = load_ota_manifest()
+    if manifest is None:
+        raise HTTPException(404, "No OTA firmware has been uploaded")
+
+    return FileResponse(
+        OTA_FIRMWARE_PATH,
+        media_type="application/octet-stream",
+        filename="firmware.bin",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Firmware-Version": str(manifest["version"]),
+            "X-Firmware-SHA256": str(manifest["sha256"]),
+        },
+    )
+
+
+def _refresh_ota_job(camera_id: str, node: dict[str, Any]) -> dict[str, Any] | None:
+    with ota_job_lock:
+        job = dict(ota_jobs.get(camera_id) or {})
+
+    if not job:
+        return None
+
+    target = str(job.get("target_version") or "")
+    installed = str(node.get("firmware") or "")
+    state = str(job.get("state") or "")
+
+    if target and installed == target and state != "completed":
+        job = set_ota_job(
+            camera_id,
+            state="completed",
+            progress_pct=100,
+            completed_at=now_local().isoformat(),
+            error="",
+        )
+
+        cfg = load_config()
+        if cfg.get("camera_mode") == "streaming":
+            start_streaming_mode(camera_id)
+
+        return job
+
+    if state in {"completed", "error"}:
+        return job
+
+    started_at = str(job.get("started_at") or "")
+    if started_at:
+        try:
+            started = datetime.fromisoformat(started_at)
+            if (now_local() - started).total_seconds() > 600:
+                return set_ota_job(
+                    camera_id,
+                    state="error",
+                    error="OTA confirmation timed out after 10 minutes",
+                    failed_at=now_local().isoformat(),
+                )
+        except Exception:
+            pass
+
+    ota_status_url = str(node.get("ota_status_url") or "")
+    if ota_status_url:
+        try:
+            req = urllib.request.Request(
+                ota_status_url,
+                headers={"User-Agent": "CamHub/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=1.5) as response:
+                payload = json.loads(
+                    response.read(8192).decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+            camera_state = str(payload.get("state") or state)
+            camera_error = str(payload.get("error") or "")
+            progress = int(payload.get("progress_pct") or 0)
+
+            if camera_state == "error":
+                return set_ota_job(
+                    camera_id,
+                    state="error",
+                    progress_pct=progress,
+                    error=camera_error or "Camera OTA failed",
+                    failed_at=now_local().isoformat(),
+                )
+
+            mapped_state = camera_state
+            if camera_state == "rebooting":
+                mapped_state = "waiting_heartbeat"
+
+            return set_ota_job(
+                camera_id,
+                state=mapped_state,
+                progress_pct=progress,
+                bytes_written=int(payload.get("bytes_written") or 0),
+                total_bytes=int(payload.get("total_bytes") or 0),
+                running_partition=payload.get("running_partition"),
+                error=camera_error,
+            )
+        except Exception:
+            if state in {
+                "downloading",
+                "verifying",
+                "rebooting",
+                "waiting_heartbeat",
+                "requested",
+                "preparing",
+            }:
+                return set_ota_job(
+                    camera_id,
+                    state="waiting_heartbeat",
+                    progress_pct=int(job.get("progress_pct") or 0),
+                )
+
+    return job
+
+
+@app.get("/api/ota/status")
+def ota_status():
+    manifest = load_ota_manifest()
+    now = now_local()
+    cameras: list[dict[str, Any]] = []
+
+    for path in NODES_DIR.glob("*.json"):
+        try:
+            node = json.loads(path.read_text(encoding="utf-8"))
+            camera_id = str(node.get("camera_id") or path.stem)
+
+            seen = datetime.fromisoformat(node["last_seen"])
+            online = (now - seen).total_seconds() < 45
+
+            job = _refresh_ota_job(camera_id, node)
+
+            cameras.append({
+                "camera_id": camera_id,
+                "camera_name": node.get("camera_name"),
+                "online": online,
+                "firmware": node.get("firmware"),
+                "ota_capable": bool(node.get("ota_capable")),
+                "ota_partition": node.get("ota_partition"),
+                "job": job,
+            })
+        except Exception:
+            continue
+
+    return {
+        "manifest": manifest,
+        "slot_size": OTA_SLOT_SIZE,
+        "cameras": cameras,
+    }
+
+
+@app.post("/api/ota/camera/{camera_id}/apply")
+def ota_apply(camera_id: str):
+    manifest = load_ota_manifest()
+    if manifest is None:
+        raise HTTPException(404, "Upload a firmware image first")
+
+    node = get_node(camera_id)
+    if not node:
+        raise HTTPException(404, "Camera node is unknown")
+
+    try:
+        seen = datetime.fromisoformat(node["last_seen"])
+        if (now_local() - seen).total_seconds() >= 45:
+            raise HTTPException(409, "Camera is offline")
+    except KeyError:
+        raise HTTPException(409, "Camera heartbeat is unavailable")
+
+    installed = str(node.get("firmware") or "")
+    target = str(manifest["version"])
+
+    if installed == target:
+        return {
+            "ok": True,
+            "already_current": True,
+            "camera_id": camera_id,
+            "version": installed,
+        }
+
+    if not bool(node.get("ota_capable")):
+        raise HTTPException(
+            409,
+            (
+                "This camera does not yet have the dual-slot OTA layout. "
+                "Flash CamNode 0.8.0 once by USB first."
+            ),
+        )
+
+    if ota_camera_busy(camera_id):
+        raise HTTPException(409, "An OTA update is already active")
+
+    with camera_operation_lock:
+        if camera_operation_active is not None or camera_operation_queue:
+            raise HTTPException(
+                409,
+                "Wait for the camera operation queue to become idle",
+            )
+
+    cfg = load_config()
+    previous_mode = str(cfg.get("camera_mode") or "automatic")
+
+    if previous_mode == "streaming":
+        stop_streaming_mode(camera_id, wait_sec=5.0)
+
+    start_url = str(node.get("ota_start_url") or "")
+    if not start_url:
+        if previous_mode == "streaming":
+            start_streaming_mode(camera_id)
+        raise HTTPException(
+            409,
+            "Camera firmware does not expose the OTA start endpoint",
+        )
+
+    query = urllib.parse.urlencode({
+        "version": target,
+        "sha256": str(manifest["sha256"]),
+    })
+
+    req = urllib.request.Request(
+        start_url + "?" + query,
+        method="POST",
+        headers={
+            "User-Agent": "CamHub/1.0",
+            "X-Cam-Token": str(cfg["upload_token"]),
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read(8192).decode(
+                "utf-8",
+                errors="replace",
+            )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if previous_mode == "streaming":
+            start_streaming_mode(camera_id)
+        raise HTTPException(
+            502,
+            f"Camera rejected OTA: HTTP {exc.code} {detail}",
+        ) from exc
+    except Exception as exc:
+        if previous_mode == "streaming":
+            start_streaming_mode(camera_id)
+        raise HTTPException(
+            502,
+            f"Unable to start OTA on camera: {exc}",
+        ) from exc
+
+    job = set_ota_job(
+        camera_id,
+        state="requested",
+        progress_pct=0,
+        target_version=target,
+        source_version=installed,
+        sha256=str(manifest["sha256"]),
+        size=int(manifest["size"]),
+        previous_mode=previous_mode,
+        started_at=now_local().isoformat(),
+        response=body[-2000:],
+        error="",
+    )
+
+    return {
+        "ok": True,
+        "already_current": False,
+        "job": job,
+    }
+
+
 @app.get("/api/nodes")
 def api_nodes():
     now = now_local()
