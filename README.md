@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 0.9.0
+## Current version: 1.0.0
 
 Architecture:
 
@@ -397,3 +397,68 @@ Alarm configuration fields:
     motion_cooldown_sec
 
 The alarm image is stored with event_type=alarm. The alarm video is stored with an alarm_video_<N>s event type. Both use the normal SHA-256, manifest and cloud-sync path.
+
+
+## CamHub 1.0.0 dashboard and OTA
+
+CamHub 1.0.0 reorganizes the operational UI into separate sections without removing the existing camera, media, cloud, alarm or diagnostic functions.
+
+Dashboard sections:
+
+    Panoramica
+    Media
+    Camera
+    Cloud
+    Firmware / OTA
+    Sistema
+
+The operational overview keeps the three camera modes visible:
+
+    Automatico
+    Streaming
+    Allarme
+
+Streaming still uses one shared ESP32 -> Raspberry MJPEG connection for browser live, manual photographs and manual video. Automatic and Alarm do not keep a continuous stream open.
+
+### Firmware / OTA
+
+CamHub stores one current CamNode firmware image plus archived uploads.
+
+Firmware upload validates:
+
+    .bin extension
+    ESP32 application image magic byte 0xE9
+    maximum OTA slot size
+    SHA-256
+
+Runtime files are stored under:
+
+    firmware/
+      camnode-current.bin
+      camnode-manifest.json
+      ota-jobs.json
+      archive/
+
+The runtime firmware directory is gitignored.
+
+The dashboard Firmware / OTA section shows:
+
+    installed firmware
+    available firmware
+    camera online status
+    active OTA partition
+    OTA capability
+    update state
+    progress
+    errors
+    update action
+
+CamHub starts OTA only when the camera operation queue is idle. Streaming is stopped before update. Camera configuration, mode changes and new camera operations are blocked while an OTA job is active.
+
+The update is considered complete only after CamHub receives a heartbeat reporting the target firmware version.
+
+OTA jobs are persisted so the dashboard can recover their state after a CamHub restart.
+
+### CI
+
+CamHub GitHub Actions validates Python syntax and config.example.json on each push.
