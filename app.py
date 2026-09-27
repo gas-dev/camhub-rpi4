@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.1.3")
+app = FastAPI(title="CamHub", version="1.1.4")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -3586,32 +3586,69 @@ def _node_url(camera_id: str, field: str, fallback_path: str) -> str:
     return str(url)
 
 
-def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]:
-    try:
-        base = _node_url(camera_id, "control_url", "/control")
-        query = (
-            f"?mode={cfg['camera_mode']}"
-            f"&mirror={1 if cfg['horizontal_mirror'] else 0}"
-            f"&flip={1 if cfg['vertical_flip'] else 0}"
-            f"&frame={cfg['camera_frame_size']}"
-            f"&quality={cfg['jpeg_quality']}"
-            f"&brightness={cfg['brightness']}"
-            f"&contrast={cfg['contrast']}"
-            f"&saturation={cfg['saturation']}"
-            f"&fps={cfg['stream_max_fps']}"
-            f"&interval={cfg['snapshot_interval_sec']}"
-            f"&alarm_video={cfg['alarm_video_sec']}"
-            f"&motion_pct={cfg['motion_threshold_pct']}"
-            f"&motion_delta={cfg['motion_pixel_delta']}"
-            f"&motion_ms={cfg['motion_sample_ms']}"
-            f"&motion_cooldown={cfg['motion_cooldown_sec']}"
-        )
-        req = urllib.request.Request(base + query, headers={"User-Agent": "CamHub/0.4.1"})
-        with urllib.request.urlopen(req, timeout=8) as response:
-            body = response.read(4096).decode("utf-8", errors="replace")
-        return True, body
-    except Exception as exc:
-        return False, str(exc)
+def push_config_to_node(
+    camera_id: str,
+    cfg: dict[str, Any],
+) -> tuple[bool, str]:
+    base = _node_url(camera_id, "control_url", "/control")
+    query = (
+        f"?mode={cfg['camera_mode']}"
+        f"&mirror={1 if cfg['horizontal_mirror'] else 0}"
+        f"&flip={1 if cfg['vertical_flip'] else 0}"
+        f"&frame={cfg['camera_frame_size']}"
+        f"&quality={cfg['jpeg_quality']}"
+        f"&brightness={cfg['brightness']}"
+        f"&contrast={cfg['contrast']}"
+        f"&saturation={cfg['saturation']}"
+        f"&fps={cfg['stream_max_fps']}"
+        f"&interval={cfg['snapshot_interval_sec']}"
+        f"&alarm_video={cfg['alarm_video_sec']}"
+        f"&motion_pct={cfg['motion_threshold_pct']}"
+        f"&motion_delta={cfg['motion_pixel_delta']}"
+        f"&motion_ms={cfg['motion_sample_ms']}"
+        f"&motion_cooldown={cfg['motion_cooldown_sec']}"
+    )
+
+    last_error = ""
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(
+                base + query,
+                headers={
+                    "User-Agent": "CamHub/1.1.4-control",
+                    "Connection": "close",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                body = response.read(4096).decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            return True, body
+
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+            last_error = (
+                f"HTTP {exc.code}: {detail or exc.reason}"
+            )
+
+            # 503 can be a short transition while the old MJPEG handler
+            # releases the camera mutex. Retry rather than rolling back
+            # immediately.
+            if exc.code != 503 or attempt >= 3:
+                break
+
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= 3:
+                break
+
+        time.sleep(0.75 * attempt)
+
+    return False, last_error
 
 
 @app.post("/api/camera/mode/{mode}")
