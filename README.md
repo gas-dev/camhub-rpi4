@@ -539,3 +539,15 @@ The dashboard Camera card now shows:
 The Firmware / OTA table also shows boot count and reset reason so a successful OTA can be verified without opening serial logs.
 
 For the first OTA validation, CamNode 0.8.1 is expected to show a firmware change, one additional persistent boot and an alternate ota_0/ota_1 partition after reboot.
+
+
+### First 0.8.1 OTA verification
+
+Because 0.8.0 did not yet contain the persistent boot counter, the first 0.8.1 boot intentionally starts the health baseline at boot #1.
+
+CamHub stores source_version and source_partition when the OTA starts. After the 0.8.1 heartbeat confirms the new firmware, the Firmware / OTA page can show the actual slot transition, for example:
+
+    source 0.8.0 / ota_0
+    -> target 0.8.1 / ota_1
+
+Subsequent firmware versions can additionally verify previous_firmware and an incremented persistent boot_count.
