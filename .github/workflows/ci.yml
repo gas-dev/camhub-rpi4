@@ -15,6 +15,14 @@ jobs:
           python-version: "3.13"
       - name: Python syntax
         run: python -m py_compile app.py
+      - name: Check undefined Python names
+        run: |
+          pip install pyflakes
+          pyflakes app.py > /tmp/pyflakes.txt || true
+          cat /tmp/pyflakes.txt
+          if grep -q "undefined name" /tmp/pyflakes.txt; then
+            exit 1
+          fi
       - name: Validate config JSON
         run: python -m json.tool config.example.json > /dev/null
       - name: Validate dashboard JavaScript
