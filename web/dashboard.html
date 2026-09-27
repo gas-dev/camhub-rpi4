@@ -204,7 +204,7 @@ th{color:var(--muted);font-weight:600}
           <h2>Modalità Allarme</h2>
           <div class="notice muted">Il movimento viene analizzato localmente sulla ESP32 in QVGA grayscale. In assenza di movimento non viene inviato uno stream video al Raspberry.</div>
           <div class="three">
-            <div><label>Video allarme, secondi</label><input id="alarm_video_sec" type="number" min="1" max="60"></div>
+            <div><label>Video allarme, secondi</label><input id="alarm_video_sec" type="number" min="1" max="600"><div class="muted" style="margin-top:5px">Fino a 10 minuti</div></div>
             <div><label>% pixel modificati</label><input id="motion_threshold_pct" type="number" min="1" max="80"></div>
             <div><label>Differenza pixel</label><input id="motion_pixel_delta" type="number" min="5" max="100"></div>
             <div><label>Campionamento, ms</label><input id="motion_sample_ms" type="number" min="150" max="5000"></div>
