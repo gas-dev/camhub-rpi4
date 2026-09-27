@@ -1886,46 +1886,157 @@ DEBUG_PAGE = r"""
 <html lang="it">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CamHub Debug</title>
+<title>CamHub Errori / Debug</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}header{padding:16px 22px;background:#171a20;border-bottom:1px solid #30343b}main{padding:18px;max-width:1400px;margin:auto}.card{background:#171a20;border:1px solid #30343b;border-radius:12px;padding:15px;margin-bottom:14px}h1,h2{margin-top:0}a{color:#8cc8ff}.ok{color:#7df07d}.bad{color:#ff7b7b}.muted{color:#999}.mono{font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;font-size:12px}button{padding:10px 13px;margin:6px 5px 0 0;border:0;border-radius:7px;cursor:pointer}table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:7px;border-bottom:1px solid #30343b;text-align:left}
-</style></head>
+:root{color-scheme:dark;--bg:#0b0e13;--panel:#131820;--border:#2a3442;--text:#edf2f7;--muted:#9aa8b8;--ok:#77df91;--bad:#ff8585;--warn:#ffd27a;--accent:#6eb6ff}
+*{box-sizing:border-box}body{font-family:Arial,sans-serif;background:var(--bg);color:var(--text);margin:0}
+header{padding:16px 22px;background:#10151c;border-bottom:1px solid var(--border)}
+main{padding:18px;max-width:1450px;margin:auto}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:15px;margin-bottom:14px}
+.metric{font-size:25px;font-weight:700;margin-top:5px}.muted{color:var(--muted)}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+a{color:var(--accent)}button,select{font:inherit;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:#202938;color:var(--text);cursor:pointer}
+.actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.mono{font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;font-size:12px}
+.issue{border-top:1px solid var(--border);padding:12px 0}.issue:first-child{border-top:0}.row{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}
+.tag{display:inline-block;padding:3px 7px;border-radius:99px;background:#202938;font-size:11px;margin-right:5px}.tag.camera{color:#ffbf70}.tag.protocol{color:#8cc8ff}.tag.camhub{color:#ff8cb8}.tag.cloud{color:#a4d58b}
+.sev-critical{color:#ff6464}.sev-error{color:#ff9a7c}.sev-warning{color:#ffd27a}
+details{margin-top:7px}summary{cursor:pointer;color:var(--muted)}
+@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
 <body>
-<header><h1>CamHub Debug</h1><div class="muted"><a href="/">← Dashboard</a> · diagnostica tecnica, cloud e camera</div></header>
+<header>
+  <h1 style="margin:0 0 4px">Errori / Debug</h1>
+  <div class="muted"><a href="/">← Dashboard</a> · problemi raggruppati per origine e gravità</div>
+</header>
 <main>
-<div class="card"><h2>Stato tecnico</h2><div id="status">Caricamento...</div><button onclick="testDrive()">Test Google Drive</button><button onclick="refresh()">Aggiorna</button><div id="testResult" class="mono"></div></div>
-<div class="card"><h2>Errori recenti</h2><div id="errors" class="muted">Caricamento...</div></div>
-<div class="card"><h2>Media con errore</h2><table><thead><tr><th>Ora</th><th>File</th><th>Tipo</th><th>Cloud</th><th>Dettaglio</th></tr></thead><tbody id="mediaErrors"></tbody></table></div>
+  <div class="grid">
+    <div class="card"><div class="muted">Camera</div><div id="countCamera" class="metric">0</div></div>
+    <div class="card"><div class="muted">Protocollo / rete</div><div id="countProtocol" class="metric">0</div></div>
+    <div class="card"><div class="muted">CamHub</div><div id="countCamHub" class="metric">0</div></div>
+    <div class="card"><div class="muted">Cloud</div><div id="countCloud" class="metric">0</div></div>
+  </div>
+
+  <div class="card">
+    <div class="actions">
+      <select id="domainFilter" onchange="refresh()">
+        <option value="">Tutte le origini</option>
+        <option value="camera">Camera</option>
+        <option value="protocol">Protocollo / rete</option>
+        <option value="camhub">CamHub</option>
+        <option value="cloud">Cloud</option>
+      </select>
+      <select id="severityFilter" onchange="refresh()">
+        <option value="">Tutte le gravità</option>
+        <option value="critical">Critici</option>
+        <option value="error">Errori</option>
+        <option value="warning">Avvisi</option>
+      </select>
+      <label class="muted"><input id="includeCleared" type="checkbox" onchange="refresh()"> mostra anche puliti</label>
+      <button onclick="refresh()">Aggiorna</button>
+      <button onclick="clearErrors()">Pulisci vista</button>
+      <button onclick="testDrive()">Test Google Drive</button>
+    </div>
+    <div id="clearInfo" class="muted" style="margin-top:8px">
+      “Pulisci vista” azzera l'elenco operativo; non cancella media, manifest o file storici di errore.
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Stato tecnico</h2>
+    <div id="status" class="muted">Caricamento...</div>
+    <div id="testResult" class="mono" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Problemi raggruppati</h2>
+    <div class="muted" style="margin-bottom:8px">
+      Eventi identici vengono raggruppati: così cinquanta errori uguali non nascondono un problema nuovo.
+    </div>
+    <div id="errors">Caricamento...</div>
+  </div>
 </main>
 <script>
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function refresh(){
- const st=await fetch('/api/status').then(r=>r.json());
- const bo=st.cloud_backoff||{};
- document.getElementById('status').innerHTML=
-   'Server: <b>'+esc(st.server_name)+'</b><br>'+
-   'Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>'+
-   'Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+' · '+(st.drive_custom_oauth?'<span class="ok">OAuth dedicato</span>':'<span class="bad">OAuth condiviso/default</span>')+'<br>'+
-   'Pendenti cloud: '+st.pending_cloud+
-   (bo.active?'<br><span class="bad">Backoff cloud: '+bo.remaining_sec+' sec</span>':'');
- const errs=await fetch('/api/errors?limit=50').then(r=>r.json());
- const box=document.getElementById('errors');
- if(!errs.length){box.textContent='Nessun errore recente.'}
- else{box.innerHTML=errs.map(er=>'<div style="border-bottom:1px solid #30343b;padding:10px 0"><div class="bad">'+esc(er.time||'')+' · '+esc(er.source||'errore')+(er.camera_id?' · '+esc(er.camera_id):'')+'</div><pre class="mono">'+esc(er.detail||'')+'</pre></div>').join('')}
- const items=await fetch('/api/recent?limit=200').then(r=>r.json());
- const bad=items.filter(x=>x.cloud_status==='ERROR'||x.error_message);
- document.getElementById('mediaErrors').innerHTML=bad.map(x=>'<tr><td>'+esc(x.captured_at||'')+'</td><td><a href="/data/'+encodeURI(x.relative)+'" target="_blank">'+esc(x.file)+'</a></td><td>'+esc(x.media_type||'')+'</td><td>'+esc(x.cloud_status||'')+'</td><td class="mono">'+esc(x.cloud_error||x.error_message||'')+'</td></tr>').join('');
-}
-async function testDrive(){
- const box=document.getElementById('testResult');box.textContent='Test in corso...';
- const r=await fetch('/api/cloud/test',{method:'POST'});const j=await r.json();
- box.textContent=(j.ok?'OK\n':'ERRORE\n')+(j.detail||'');
- setTimeout(refresh,500);
-}
-refresh();setInterval(refresh,15000);
-</script></body></html>
-"""
+function labelDomain(d){return({camera:'CAMERA',protocol:'PROTOCOLLO',camhub:'CAMHUB',cloud:'CLOUD'})[d]||String(d||'ERRORE').toUpperCase()}
+function labelSeverity(s){return({critical:'CRITICO',error:'ERRORE',warning:'AVVISO'})[s]||String(s||'').toUpperCase()}
 
+async function refresh(){
+  const [st,sum]=await Promise.all([
+    fetch('/api/status').then(r=>r.json()),
+    fetch('/api/errors/summary').then(r=>r.json())
+  ]);
+
+  document.getElementById('countCamera').textContent=(sum.by_domain||{}).camera||0;
+  document.getElementById('countProtocol').textContent=(sum.by_domain||{}).protocol||0;
+  document.getElementById('countCamHub').textContent=(sum.by_domain||{}).camhub||0;
+  document.getElementById('countCloud').textContent=(sum.by_domain||{}).cloud||0;
+
+  const bo=st.cloud_backoff||{};
+  const sev=sum.by_severity||{};
+  document.getElementById('status').innerHTML=
+    'Critici: <b class="bad">'+Number(sev.critical||0)+'</b> · Errori: <b>'+Number(sev.error||0)+'</b> · Avvisi: '+Number(sev.warning||0)+'<br>'+
+    'Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+' · '+
+    'Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+' · pendenti '+st.pending_cloud+
+    (bo.active?'<br><span class="warn">Backoff cloud: '+bo.remaining_sec+' s</span>':'')+
+    (sum.cleared_before?'<br>Vista pulita fino a: '+esc(sum.cleared_before):'');
+
+  const domain=document.getElementById('domainFilter').value;
+  const severity=document.getElementById('severityFilter').value;
+  const include=document.getElementById('includeCleared').checked;
+  const qs=new URLSearchParams({limit:'100'});
+  if(domain)qs.set('domain',domain);
+  if(severity)qs.set('severity',severity);
+  if(include)qs.set('include_cleared','true');
+
+  const errs=await fetch('/api/errors?'+qs.toString()).then(r=>r.json());
+  const box=document.getElementById('errors');
+
+  if(!errs.length){
+    box.innerHTML='<div class="ok">Nessun problema nella vista corrente.</div>';
+    return;
+  }
+
+  box.innerHTML=errs.map(er=>{
+    const cls='sev-'+esc(er.severity||'warning');
+    const repeat=Number(er.count||1)>1?' · <b>×'+Number(er.count)+'</b>':'';
+    const range=Number(er.count||1)>1?'<div class="muted">Prima: '+esc(er.first_seen||'')+' · Ultima: '+esc(er.last_seen||'')+'</div>':'<div class="muted">'+esc(er.last_seen||'')+'</div>';
+    return '<div class="issue">'+
+      '<div class="row"><div>'+
+        '<span class="tag '+esc(er.domain)+'">'+labelDomain(er.domain)+'</span>'+
+        '<span class="'+cls+'"><b>'+labelSeverity(er.severity)+'</b></span>'+repeat+
+        (er.camera_id?' · '+esc(er.camera_id):'')+
+      '</div><div class="muted">'+esc(er.category||er.source||'')+'</div></div>'+
+      '<div style="margin-top:7px"><b>'+esc(er.title||'')+'</b></div>'+
+      range+
+      '<details><summary>Dettaglio tecnico</summary><pre class="mono">'+esc(er.detail||'')+'</pre></details>'+
+    '</div>';
+  }).join('');
+}
+
+async function clearErrors(){
+  if(!confirm('Pulire la vista errori? I file storici e i media non verranno cancellati.'))return;
+  const r=await fetch('/api/errors/clear',{method:'POST'});
+  const j=await r.json();
+  document.getElementById('clearInfo').textContent=j.message||'Vista pulita.';
+  document.getElementById('includeCleared').checked=false;
+  await refresh();
+}
+
+async function testDrive(){
+  const box=document.getElementById('testResult');
+  box.textContent='Test in corso...';
+  const r=await fetch('/api/cloud/test',{method:'POST'});
+  const j=await r.json();
+  box.textContent=(j.ok?'OK\n':'ERRORE\n')+(j.detail||'');
+  setTimeout(refresh,500);
+}
+
+refresh();
+setInterval(refresh,15000);
+</script>
+</body>
+</html>
+"""
 
 @app.get("/debug", response_class=HTMLResponse)
 def debug_page():
