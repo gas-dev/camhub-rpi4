@@ -3133,24 +3133,73 @@ async def node_error(
 
 
 @app.post("/api/node/heartbeat")
-async def node_heartbeat(request: Request, x_cam_token: str | None = Header(default=None)):
+async def node_heartbeat(
+    request: Request,
+    x_cam_token: str | None = Header(default=None),
+):
     cfg = load_config()
+
     if x_cam_token != cfg["upload_token"]:
-        raise HTTPException(401, "Invalid camera token")
+        raise HTTPException(
+            401,
+            "Invalid camera token",
+        )
+
     payload = await request.json()
-    camera_id = str(payload.get("camera_id") or cfg["camera_id"])
+
+    camera_id = str(
+        payload.get("camera_id")
+        or cfg["camera_id"]
+    )
+
     payload["camera_id"] = camera_id
     payload["last_seen"] = now_local().isoformat()
-    payload["observed_ip"] = request.client.host if request.client else None
+    payload["observed_ip"] = (
+        request.client.host
+        if request.client
+        else None
+    )
+
     save_node(camera_id, payload)
 
-    if payload.get("service_ready") is True:
-        camera_maintenance_until.pop(camera_id, None)
+    state = str(
+        payload.get("state")
+        or ""
+    ).lower()
 
-    if cfg.get("camera_mode") == "streaming":
+    active_mode = str(
+        payload.get("active_mode")
+        or payload.get("mode")
+        or ""
+    ).lower()
+
+    if state in {"ready", "standby"}:
+        camera_maintenance_until.pop(
+            camera_id,
+            None,
+        )
+
+    should_stream = (
+        cfg.get("camera_mode") == "streaming"
+        and active_mode == "streaming"
+        and state == "ready"
+        and bool(payload.get("camera_ready"))
+    )
+
+    if should_stream:
         start_streaming_mode(camera_id)
+    else:
+        # Never leave a stale Raspberry MJPEG reader attached while CamNode
+        # is transitioning, recovering, in standby, OTA or error.
+        stop_streaming_mode(
+            camera_id,
+            wait_sec=0.2,
+        )
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "desired_mode": cfg.get("camera_mode"),
+    }
 
 @app.post("/api/node/alarm")
 async def node_alarm(
@@ -3402,57 +3451,173 @@ def ota_firmware_download(
     )
 
 
-def _refresh_ota_job(camera_id: str, node: dict[str, Any]) -> dict[str, Any] | None:
+def _refresh_ota_job(
+    camera_id: str,
+    node: dict[str, Any],
+) -> dict[str, Any] | None:
     with ota_job_lock:
-        job = dict(ota_jobs.get(camera_id) or {})
+        job = dict(
+            ota_jobs.get(camera_id)
+            or {}
+        )
 
     if not job:
         return None
 
-    target = str(job.get("target_version") or "")
-    installed = str(node.get("firmware") or "")
-    state = str(job.get("state") or "")
+    target = str(
+        job.get("target_version")
+        or ""
+    )
 
-    if target and installed == target and state != "completed":
-        job = set_ota_job(
+    installed = str(
+        node.get("firmware")
+        or ""
+    )
+
+    state = str(
+        job.get("state")
+        or ""
+    )
+
+    if state == "completed":
+        return job
+
+    # New firmware heartbeat is the authoritative OTA confirmation.
+    if target and installed == target:
+        previous_mode = str(
+            job.get("previous_mode")
+            or "automatic"
+        )
+
+        if previous_mode == "standby":
+            return set_ota_job(
+                camera_id,
+                state="completed",
+                progress_pct=100,
+                completed_at=now_local().isoformat(),
+                error="",
+            )
+
+        if _node_mode_ready(
+            node,
+            previous_mode,
+        ):
+            if previous_mode == "streaming":
+                start_streaming_mode(camera_id)
+
+            return set_ota_job(
+                camera_id,
+                state="completed",
+                progress_pct=100,
+                completed_at=now_local().isoformat(),
+                error="",
+            )
+
+        # Firmware is confirmed but the pre-OTA operating mode still needs
+        # restoration. Keep this separate from firmware success so the UI
+        # shows exactly what is happening.
+        cfg = load_config()
+
+        if cfg.get("camera_mode") != previous_mode:
+            cfg["camera_mode"] = previous_mode
+            save_config(cfg)
+
+        last_push_at = str(
+            job.get("restore_push_at")
+            or ""
+        )
+
+        can_push = True
+
+        if last_push_at:
+            try:
+                pushed = datetime.fromisoformat(
+                    last_push_at
+                )
+                can_push = (
+                    now_local() - pushed
+                ).total_seconds() >= 3.0
+            except Exception:
+                pass
+
+        if can_push:
+            accepted, message = push_config_to_node(
+                camera_id,
+                cfg,
+            )
+
+            return set_ota_job(
+                camera_id,
+                state="restoring_mode",
+                progress_pct=100,
+                firmware_confirmed_at=(
+                    job.get("firmware_confirmed_at")
+                    or now_local().isoformat()
+                ),
+                restore_push_at=now_local().isoformat(),
+                restore_accepted=accepted,
+                restore_message=message,
+                error="",
+            )
+
+        return set_ota_job(
             camera_id,
-            state="completed",
+            state="restoring_mode",
             progress_pct=100,
-            completed_at=now_local().isoformat(),
+            firmware_confirmed_at=(
+                job.get("firmware_confirmed_at")
+                or now_local().isoformat()
+            ),
             error="",
         )
 
-        cfg = load_config()
-        if cfg.get("camera_mode") == "streaming":
-            start_streaming_mode(camera_id)
-
+    if state == "error":
         return job
 
-    if state in {"completed", "error"}:
-        return job
+    started_at = str(
+        job.get("started_at")
+        or ""
+    )
 
-    started_at = str(job.get("started_at") or "")
     if started_at:
         try:
-            started = datetime.fromisoformat(started_at)
-            if (now_local() - started).total_seconds() > 600:
+            started = datetime.fromisoformat(
+                started_at
+            )
+
+            if (
+                now_local() - started
+            ).total_seconds() > 600:
                 return set_ota_job(
                     camera_id,
                     state="error",
-                    error="OTA confirmation timed out after 10 minutes",
+                    error=(
+                        "OTA confirmation timed out "
+                        "after 10 minutes"
+                    ),
                     failed_at=now_local().isoformat(),
                 )
         except Exception:
             pass
 
-    ota_status_url = str(node.get("ota_status_url") or "")
+    ota_status_url = str(
+        node.get("ota_status_url")
+        or ""
+    )
+
     if ota_status_url:
         try:
             req = urllib.request.Request(
                 ota_status_url,
-                headers={"User-Agent": "CamHub/1.0"},
+                headers={
+                    "User-Agent": "CamHub/2.0-ota-status",
+                },
             )
-            with urllib.request.urlopen(req, timeout=1.5) as response:
+
+            with urllib.request.urlopen(
+                req,
+                timeout=1.5,
+            ) as response:
                 payload = json.loads(
                     response.read(8192).decode(
                         "utf-8",
@@ -3460,20 +3625,35 @@ def _refresh_ota_job(camera_id: str, node: dict[str, Any]) -> dict[str, Any] | N
                     )
                 )
 
-            camera_state = str(payload.get("state") or state)
-            camera_error = str(payload.get("error") or "")
-            progress = int(payload.get("progress_pct") or 0)
+            camera_state = str(
+                payload.get("state")
+                or state
+            )
+
+            camera_error = str(
+                payload.get("error")
+                or ""
+            )
+
+            progress = int(
+                payload.get("progress_pct")
+                or 0
+            )
 
             if camera_state == "error":
                 return set_ota_job(
                     camera_id,
                     state="error",
                     progress_pct=progress,
-                    error=camera_error or "Camera OTA failed",
+                    error=(
+                        camera_error
+                        or "Camera OTA failed"
+                    ),
                     failed_at=now_local().isoformat(),
                 )
 
             mapped_state = camera_state
+
             if camera_state == "rebooting":
                 mapped_state = "waiting_heartbeat"
 
@@ -3481,11 +3661,20 @@ def _refresh_ota_job(camera_id: str, node: dict[str, Any]) -> dict[str, Any] | N
                 camera_id,
                 state=mapped_state,
                 progress_pct=progress,
-                bytes_written=int(payload.get("bytes_written") or 0),
-                total_bytes=int(payload.get("total_bytes") or 0),
-                running_partition=payload.get("running_partition"),
+                bytes_written=int(
+                    payload.get("bytes_written")
+                    or 0
+                ),
+                total_bytes=int(
+                    payload.get("total_bytes")
+                    or 0
+                ),
+                running_partition=payload.get(
+                    "running_partition"
+                ),
                 error=camera_error,
             )
+
         except Exception:
             if state in {
                 "downloading",
@@ -3494,11 +3683,15 @@ def _refresh_ota_job(camera_id: str, node: dict[str, Any]) -> dict[str, Any] | N
                 "waiting_heartbeat",
                 "requested",
                 "preparing",
+                "entering_standby",
             }:
                 return set_ota_job(
                     camera_id,
                     state="waiting_heartbeat",
-                    progress_pct=int(job.get("progress_pct") or 0),
+                    progress_pct=int(
+                        job.get("progress_pct")
+                        or 0
+                    ),
                 )
 
     return job
@@ -3563,22 +3756,35 @@ def ota_status():
 @app.post("/api/ota/camera/{camera_id}/apply")
 def ota_apply(camera_id: str):
     manifest = load_ota_manifest()
+
     if manifest is None:
-        raise HTTPException(404, "Upload a firmware image first")
+        raise HTTPException(
+            404,
+            "Upload a firmware image first",
+        )
 
     node = get_node(camera_id)
+
     if not node:
-        raise HTTPException(404, "Camera node is unknown")
+        raise HTTPException(
+            404,
+            "Camera node is unknown",
+        )
 
-    try:
-        seen = datetime.fromisoformat(node["last_seen"])
-        if (now_local() - seen).total_seconds() >= 45:
-            raise HTTPException(409, "Camera is offline")
-    except KeyError:
-        raise HTTPException(409, "Camera heartbeat is unavailable")
+    if not _node_is_fresh(node, 45.0):
+        raise HTTPException(
+            409,
+            "Camera is offline",
+        )
 
-    installed = str(node.get("firmware") or "")
-    target = str(manifest["version"])
+    installed = str(
+        node.get("firmware")
+        or ""
+    )
+
+    target = str(
+        manifest["version"]
+    )
 
     if installed == target:
         return {
@@ -3588,42 +3794,116 @@ def ota_apply(camera_id: str):
             "version": installed,
         }
 
-    # OTA is a control-plane operation and must remain available even when
-    # the image pipeline is unhealthy. A live heartbeat + OTA capability is
-    # sufficient; otherwise a broken sensor could prevent the very firmware
-    # update needed to repair it.
     if not bool(node.get("ota_capable")):
         raise HTTPException(
             409,
             (
-                "This camera does not yet have the dual-slot OTA layout. "
-                "Flash CamNode 0.8.0 once by USB first."
+                "This camera does not have the "
+                "dual-slot OTA layout."
             ),
         )
 
     if ota_camera_busy(camera_id):
-        raise HTTPException(409, "An OTA update is already active")
+        raise HTTPException(
+            409,
+            "An OTA update is already active",
+        )
 
     with camera_operation_lock:
-        if camera_operation_active is not None or camera_operation_queue:
+        if (
+            camera_operation_active is not None
+            or camera_operation_queue
+        ):
             raise HTTPException(
                 409,
-                "Wait for the camera operation queue to become idle",
+                (
+                    "Wait for the camera operation "
+                    "queue to become idle"
+                ),
             )
 
     cfg = load_config()
-    previous_mode = str(cfg.get("camera_mode") or "automatic")
+    previous_mode = str(
+        cfg.get("camera_mode")
+        or "automatic"
+    )
 
     if previous_mode == "streaming":
-        stop_streaming_mode(camera_id, wait_sec=5.0)
+        stop_streaming_mode(
+            camera_id,
+            wait_sec=2.0,
+        )
 
-    start_url = str(node.get("ota_start_url") or "")
+    # 0.8.x is a one-time migration exception: those firmwares do not know
+    # the standby mode yet. From CamNode 1.x onward standby is mandatory
+    # before OTA.
+    legacy_migration = installed.startswith("0.")
+
+    standby_confirmed = False
+
+    if not legacy_migration:
+        standby_cfg = dict(cfg)
+        standby_cfg["camera_mode"] = "standby"
+        save_config(standby_cfg)
+
+        accepted, standby_message = push_config_to_node(
+            camera_id,
+            standby_cfg,
+        )
+
+        if not accepted:
+            save_config(cfg)
+
+            raise HTTPException(
+                502,
+                (
+                    "Camera did not accept standby "
+                    f"before OTA: {standby_message}"
+                ),
+            )
+
+        standby_confirmed, standby_node = wait_for_node_mode(
+            camera_id,
+            "standby",
+            timeout_sec=30.0,
+        )
+
+        if not standby_confirmed:
+            save_config(cfg)
+            push_config_to_node(
+                camera_id,
+                cfg,
+            )
+
+            raise HTTPException(
+                504,
+                (
+                    "Camera did not confirm standby "
+                    "within 30 seconds before OTA"
+                ),
+            )
+
+        node = standby_node or get_node(camera_id) or node
+
+    start_url = str(
+        node.get("ota_start_url")
+        or ""
+    )
+
     if not start_url:
-        if previous_mode == "streaming":
-            start_streaming_mode(camera_id)
+        if not legacy_migration:
+            save_config(cfg)
+            push_config_to_node(
+                camera_id,
+                cfg,
+            )
+
         raise HTTPException(
             409,
-            "Camera firmware does not expose the OTA start endpoint",
+            (
+                "Camera firmware does not expose "
+                "the OTA start endpoint"
+            ),
         )
 
     query = urllib.parse.urlencode({
@@ -3635,28 +3915,52 @@ def ota_apply(camera_id: str):
         start_url + "?" + query,
         method="POST",
         headers={
-            "User-Agent": "CamHub/1.1.5-ota",
-            "X-Cam-Token": str(cfg["upload_token"]),
+            "User-Agent": "CamHub/2.0-ota",
+            "X-Cam-Token": str(
+                cfg["upload_token"]
+            ),
         },
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(
+            req,
+            timeout=10,
+        ) as response:
             body = response.read(8192).decode(
                 "utf-8",
                 errors="replace",
             )
+
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if previous_mode == "streaming":
-            start_streaming_mode(camera_id)
+        detail = exc.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        if not legacy_migration:
+            save_config(cfg)
+            push_config_to_node(
+                camera_id,
+                cfg,
+            )
+
         raise HTTPException(
             502,
-            f"Camera rejected OTA: HTTP {exc.code} {detail}",
+            (
+                f"Camera rejected OTA: "
+                f"HTTP {exc.code} {detail}"
+            ),
         ) from exc
+
     except Exception as exc:
-        if previous_mode == "streaming":
-            start_streaming_mode(camera_id)
+        if not legacy_migration:
+            save_config(cfg)
+            push_config_to_node(
+                camera_id,
+                cfg,
+            )
+
         raise HTTPException(
             502,
             f"Unable to start OTA on camera: {exc}",
@@ -3668,11 +3972,18 @@ def ota_apply(camera_id: str):
         progress_pct=0,
         target_version=target,
         source_version=installed,
-        source_partition=str(node.get("ota_partition") or ""),
-        source_boot_count=node.get("boot_count"),
+        source_partition=str(
+            node.get("ota_partition")
+            or ""
+        ),
+        source_boot_count=node.get(
+            "boot_count"
+        ),
         sha256=str(manifest["sha256"]),
         size=int(manifest["size"]),
         previous_mode=previous_mode,
+        standby_confirmed=standby_confirmed,
+        legacy_migration=legacy_migration,
         started_at=now_local().isoformat(),
         response=body[-2000:],
         error="",
@@ -3685,65 +3996,136 @@ def ota_apply(camera_id: str):
     }
 
 
-def camera_health(node: dict[str, Any]) -> dict[str, Any]:
+def camera_health(
+    node: dict[str, Any],
+) -> dict[str, Any]:
     issues: list[dict[str, str]] = []
     level = "ok"
 
-    def add_issue(severity: str, code: str, message: str) -> None:
+    def add_issue(
+        severity: str,
+        code: str,
+        message: str,
+    ) -> None:
         nonlocal level
+
         issues.append({
             "severity": severity,
             "code": code,
             "message": message,
         })
+
         if severity == "error":
             level = "error"
-        elif severity == "warning" and level == "ok":
+        elif (
+            severity == "warning"
+            and level == "ok"
+        ):
             level = "warning"
 
     if not bool(node.get("online")):
-        add_issue("error", "offline", "Camera offline")
-    elif node.get("camera_pipeline_healthy") is False:
         add_issue(
             "error",
-            "camera_pipeline_unhealthy",
-            "Pipeline camera senza framebuffer · recovery automatico in corso",
-        )
-    elif node.get("service_ready") is False:
-        remaining_ms = int(node.get("startup_grace_remaining_ms") or 0)
-        remaining_sec = max(0, (remaining_ms + 999) // 1000)
-        add_issue(
-            "warning",
-            "startup_grace",
-            (
-                f"Camera in avvio"
-                + (f" · pronta tra ~{remaining_sec}s" if remaining_sec else "")
-            ),
+            "offline",
+            "Camera offline",
         )
 
-    rssi = int(node.get("rssi") or -127)
+    state = str(
+        node.get("state")
+        or ""
+    ).lower()
+
+    active_mode = str(
+        node.get("active_mode")
+        or node.get("mode")
+        or ""
+    ).lower()
+
+    if bool(node.get("online")):
+        if state == "error":
+            message = str(
+                node.get("last_error_message")
+                or "Camera state machine in error"
+            )
+
+            add_issue(
+                "error",
+                "camera_state_error",
+                message,
+            )
+
+        elif state in {
+            "booting",
+            "transition",
+            "recovering",
+            "ota",
+        }:
+            add_issue(
+                "warning",
+                "camera_busy_state",
+                f"Camera {state}",
+            )
+
+        elif (
+            active_mode != "standby"
+            and state == "ready"
+            and not bool(node.get("camera_ready"))
+        ):
+            add_issue(
+                "error",
+                "camera_not_ready",
+                "Camera state READY but no working image pipeline",
+            )
+
+    rssi = int(
+        node.get("rssi")
+        or -127
+    )
+
     if bool(node.get("online")):
         if rssi <= -88:
-            add_issue("error", "wifi_critical", f"Wi-Fi molto debole ({rssi} dBm)")
+            add_issue(
+                "error",
+                "wifi_critical",
+                f"Wi-Fi molto debole ({rssi} dBm)",
+            )
         elif rssi <= -80:
-            add_issue("warning", "wifi_weak", f"Wi-Fi debole ({rssi} dBm)")
+            add_issue(
+                "warning",
+                "wifi_weak",
+                f"Wi-Fi debole ({rssi} dBm)",
+            )
 
-    min_heap = int(node.get("min_free_heap") or 0)
+    min_heap = int(
+        node.get("min_free_heap")
+        or 0
+    )
+
     if min_heap > 0:
         if min_heap < 30000:
             add_issue(
                 "error",
                 "heap_critical",
-                f"Heap minimo molto basso ({min_heap // 1024} KB)",
+                (
+                    "Heap minimo molto basso "
+                    f"({min_heap // 1024} KB)"
+                ),
             )
         elif min_heap < 50000:
             add_issue(
                 "warning",
                 "heap_low",
-                f"Heap minimo basso ({min_heap // 1024} KB)",
+                (
+                    "Heap minimo basso "
+                    f"({min_heap // 1024} KB)"
+                ),
             )
 
-    reset_reason = str(node.get("reset_reason") or "").upper()
+    reset_reason = str(
+        node.get("reset_reason")
+        or ""
+    ).upper()
+
     if reset_reason in {
         "PANIC",
         "INTERRUPT_WATCHDOG",
@@ -3757,12 +4139,20 @@ def camera_health(node: dict[str, Any]) -> dict[str, Any]:
             f"Ultimo reset anomalo: {reset_reason}",
         )
 
-    recovery_failures = int(node.get("driver_recovery_failures") or 0)
+    recovery_failures = int(
+        node.get("camera_recovery_failures")
+        or node.get("driver_recovery_failures")
+        or 0
+    )
+
     if recovery_failures > 0:
         add_issue(
-            "error",
+            "warning",
             "camera_recovery_failure",
-            f"Recovery driver camera falliti: {recovery_failures}",
+            (
+                "Recovery camera falliti: "
+                f"{recovery_failures}"
+            ),
         )
 
     labels = {
