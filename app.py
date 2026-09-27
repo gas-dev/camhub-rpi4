@@ -2645,6 +2645,7 @@ def ota_status():
                 "online": online,
                 "firmware": node.get("firmware"),
                 "previous_firmware": node.get("previous_firmware"),
+                "health_baseline_initialized": bool(node.get("health_baseline_initialized")),
                 "firmware_changed_at_boot": bool(node.get("firmware_changed_at_boot")),
                 "boot_count": node.get("boot_count"),
                 "reset_reason": node.get("reset_reason"),
