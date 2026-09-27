@@ -24,10 +24,18 @@ CONFIG_PATH = BASE_DIR / "config.json"
 GOOGLE_OAUTH_PATH = BASE_DIR / "google_oauth.json"
 DATA_DIR = BASE_DIR / "data"
 NODES_DIR = BASE_DIR / "nodes"
+FIRMWARE_DIR = BASE_DIR / "firmware"
+OTA_MANIFEST_PATH = FIRMWARE_DIR / "camnode-manifest.json"
+OTA_FIRMWARE_PATH = FIRMWARE_DIR / "camnode-current.bin"
+OTA_JOBS_PATH = FIRMWARE_DIR / "ota-jobs.json"
+OTA_SLOT_SIZE = 0x1E0000
+
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
+FIRMWARE_DIR.mkdir(exist_ok=True)
+(FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.9.0")
+app = FastAPI(title="CamHub", version="1.0.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -42,6 +50,9 @@ stream_thread_lock = threading.RLock()
 stream_threads: dict[str, threading.Thread] = {}
 stream_stop_events: dict[str, threading.Event] = {}
 alarm_last_event: dict[str, float] = {}
+
+ota_job_lock = threading.RLock()
+ota_jobs: dict[str, dict[str, Any]] = {}
 
 camera_operation_worker_started = False
 automatic_scheduler_started = False
@@ -189,6 +200,65 @@ def load_config() -> dict[str, Any]:
 
 def now_local() -> datetime:
     return datetime.now().astimezone()
+
+
+def load_ota_manifest() -> dict[str, Any] | None:
+    if not OTA_MANIFEST_PATH.exists() or not OTA_FIRMWARE_PATH.exists():
+        return None
+    try:
+        data = json.loads(OTA_MANIFEST_PATH.read_text(encoding="utf-8"))
+        if int(data.get("size") or 0) != OTA_FIRMWARE_PATH.stat().st_size:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def load_ota_jobs() -> None:
+    global ota_jobs
+    if not OTA_JOBS_PATH.exists():
+        return
+    try:
+        data = json.loads(OTA_JOBS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            with ota_job_lock:
+                ota_jobs = data
+    except Exception:
+        pass
+
+
+def save_ota_jobs() -> None:
+    with ota_job_lock:
+        snapshot = dict(ota_jobs)
+    tmp = OTA_JOBS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    tmp.replace(OTA_JOBS_PATH)
+
+
+def ota_camera_busy(camera_id: str) -> bool:
+    with ota_job_lock:
+        job = ota_jobs.get(camera_id)
+        if not job:
+            return False
+        return str(job.get("state") or "") in {
+            "requested",
+            "preparing",
+            "downloading",
+            "verifying",
+            "rebooting",
+            "waiting_heartbeat",
+        }
+
+
+def set_ota_job(camera_id: str, **updates: Any) -> dict[str, Any]:
+    with ota_job_lock:
+        current = dict(ota_jobs.get(camera_id) or {})
+        current.update(updates)
+        current["camera_id"] = camera_id
+        ota_jobs[camera_id] = current
+        result = dict(current)
+    save_ota_jobs()
+    return result
 
 
 def camera_day_dir(camera_id: str, dt: datetime) -> Path:
@@ -1428,6 +1498,7 @@ def queue_cloud_sync(force: bool = False) -> None:
 @app.on_event("startup")
 def startup_event() -> None:
     cfg = load_config()
+    load_ota_jobs()
     ensure_cloud_worker()
     ensure_camera_operation_worker()
     ensure_automatic_snapshot_scheduler()
