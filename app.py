@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,7 +27,7 @@ NODES_DIR = BASE_DIR / "nodes"
 DATA_DIR.mkdir(exist_ok=True)
 NODES_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="0.8.0")
+app = FastAPI(title="CamHub", version="0.9.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -35,6 +35,13 @@ cloud_worker_started = False
 cloud_backoff_until = 0.0
 cloud_backoff_reason = ""
 cloud_backoff_lock = threading.RLock()
+
+stream_frame_lock = threading.RLock()
+stream_frame_cache: dict[str, dict[str, Any]] = {}
+stream_thread_lock = threading.RLock()
+stream_threads: dict[str, threading.Thread] = {}
+stream_stop_events: dict[str, threading.Event] = {}
+alarm_last_event: dict[str, float] = {}
 
 camera_operation_worker_started = False
 automatic_scheduler_started = False
@@ -65,6 +72,11 @@ DEFAULT_CONFIG = {
     "snapshot_interval_sec": 60,
     "camera_mode": "automatic",
     "event_video_sec": 10,
+    "alarm_video_sec": 10,
+    "motion_threshold_pct": 8,
+    "motion_pixel_delta": 24,
+    "motion_sample_ms": 500,
+    "motion_cooldown_sec": 15,
     "motion_enabled": False,
     "drive_enabled": False,
     "drive_remote": "gdrive",
@@ -96,6 +108,11 @@ class ConfigModel(BaseModel):
     snapshot_interval_sec: int = 60
     camera_mode: str = "automatic"
     event_video_sec: int = 10
+    alarm_video_sec: int = 10
+    motion_threshold_pct: int = 8
+    motion_pixel_delta: int = 24
+    motion_sample_ms: int = 500
+    motion_cooldown_sec: int = 15
     motion_enabled: bool = False
     drive_enabled: bool = False
     drive_remote: str = "gdrive"
@@ -306,6 +323,151 @@ def get_node(camera_id: str) -> dict[str, Any] | None:
         return None
 
 
+def set_stream_frame(camera_id: str, frame: bytes) -> None:
+    now_mono = time.monotonic()
+    with stream_frame_lock:
+        previous = stream_frame_cache.get(camera_id, {})
+        previous_at = float(previous.get("received_mono") or 0.0)
+        previous_fps = float(previous.get("source_fps") or 0.0)
+        instant_fps = 0.0
+        if previous_at > 0 and now_mono > previous_at:
+            instant_fps = 1.0 / (now_mono - previous_at)
+        source_fps = (
+            instant_fps
+            if previous_fps <= 0
+            else previous_fps * 0.8 + instant_fps * 0.2
+        )
+        stream_frame_cache[camera_id] = {
+            "frame": frame,
+            "seq": int(previous.get("seq") or 0) + 1,
+            "received_mono": now_mono,
+            "received_at": time.time(),
+            "source_fps": min(source_fps, 60.0),
+        }
+
+
+def get_stream_frame(
+    camera_id: str,
+    max_age: float = 5.0,
+) -> dict[str, Any] | None:
+    with stream_frame_lock:
+        item = stream_frame_cache.get(camera_id)
+        if not item:
+            return None
+        if (
+            time.monotonic()
+            - float(item.get("received_mono") or 0.0)
+            > max_age
+        ):
+            return None
+        return dict(item)
+
+
+def clear_stream_frame(camera_id: str) -> None:
+    with stream_frame_lock:
+        stream_frame_cache.pop(camera_id, None)
+
+
+def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
+    try:
+        node = get_node(camera_id)
+        stream_url = str((node or {}).get("stream_url") or "")
+        if not stream_url:
+            raise RuntimeError("Camera stream URL unavailable")
+
+        request = urllib.request.Request(
+            stream_url,
+            headers={"User-Agent": "CamHub/0.9-stream", "Connection": "close"},
+        )
+
+        with urllib.request.urlopen(request, timeout=15) as response:
+            buffer = b""
+
+            while not stop_event.is_set():
+                if load_config().get("camera_mode") != "streaming":
+                    break
+
+                chunk = response.read(8192)
+                if not chunk:
+                    break
+                buffer += chunk
+
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start < 0:
+                        if len(buffer) > 2:
+                            buffer = buffer[-2:]
+                        break
+
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end < 0:
+                        if start > 0:
+                            buffer = buffer[start:]
+                        if len(buffer) > 8 * 1024 * 1024:
+                            buffer = b""
+                        break
+
+                    frame = buffer[start:end + 2]
+                    buffer = buffer[end + 2:]
+                    if len(frame) > 1024:
+                        set_stream_frame(camera_id, frame)
+
+    except Exception as exc:
+        if not stop_event.is_set() and load_config().get("camera_mode") == "streaming":
+            record_runtime_error("streaming_mode", str(exc), camera_id)
+    finally:
+        clear_stream_frame(camera_id)
+        with stream_thread_lock:
+            current = stream_threads.get(camera_id)
+            if current is threading.current_thread():
+                stream_threads.pop(camera_id, None)
+                stream_stop_events.pop(camera_id, None)
+
+
+def start_streaming_mode(camera_id: str) -> None:
+    with stream_thread_lock:
+        existing = stream_threads.get(camera_id)
+        if existing and existing.is_alive():
+            return
+
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=_stream_reader,
+            args=(camera_id, stop_event),
+            daemon=True,
+            name=f"camhub-streaming-{camera_id}",
+        )
+        stream_stop_events[camera_id] = stop_event
+        stream_threads[camera_id] = worker
+        worker.start()
+
+
+def stop_streaming_mode(camera_id: str, wait_sec: float = 4.0) -> None:
+    with stream_thread_lock:
+        stop_event = stream_stop_events.get(camera_id)
+        worker = stream_threads.get(camera_id)
+        if stop_event:
+            stop_event.set()
+
+    if worker and worker.is_alive():
+        worker.join(timeout=wait_sec)
+
+    clear_stream_frame(camera_id)
+
+
+def streaming_mode_status(camera_id: str) -> dict[str, Any]:
+    with stream_thread_lock:
+        worker = stream_threads.get(camera_id)
+        running = bool(worker and worker.is_alive())
+
+    frame = get_stream_frame(camera_id, max_age=5.0)
+    return {
+        "running": running,
+        "frame_available": frame is not None,
+        "source_fps": round(float((frame or {}).get("source_fps") or 0.0), 1),
+    }
+
+
 def camera_operation_status() -> dict[str, Any]:
     with camera_operation_lock:
         active = dict(camera_operation_active) if camera_operation_active else None
@@ -332,6 +494,7 @@ def enqueue_camera_operation(
     camera_id: str,
     duration: int = 0,
     origin: str = "manual",
+    priority: bool = False,
 ) -> dict[str, Any]:
     global camera_operation_seq
 
@@ -346,8 +509,12 @@ def enqueue_camera_operation(
             "status": "queued",
             "queued_at": now_local().isoformat(),
         }
-        camera_operation_queue.append(item)
-        position = len(camera_operation_queue)
+        if priority:
+            camera_operation_queue.appendleft(item)
+            position = 1
+        else:
+            camera_operation_queue.append(item)
+            position = len(camera_operation_queue)
 
     camera_operation_event.set()
     result = dict(item)
@@ -418,7 +585,156 @@ def _direct_camera_photo(camera_id: str, event_type: str) -> dict[str, Any]:
     )
 
 
-def _exclusive_camera_video(camera_id: str, seconds: int) -> dict[str, Any]:
+def _streaming_photo(camera_id: str) -> dict[str, Any]:
+    deadline = time.monotonic() + 5.0
+    frame = get_stream_frame(camera_id, max_age=3.0)
+
+    while frame is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+        frame = get_stream_frame(camera_id, max_age=3.0)
+
+    if frame is None:
+        raise RuntimeError("Streaming mode has no recent frame")
+
+    payload = bytes(frame["frame"])
+    dt = now_local()
+    out_path = camera_day_dir(camera_id, dt) / make_filename(
+        camera_id,
+        "manual",
+        dt,
+        ".jpg",
+    )
+    out_path.write_bytes(payload)
+    meta = register_media(
+        out_path,
+        camera_id,
+        "manual",
+        dt,
+        "shared_stream",
+    )
+    return {
+        "file": out_path.name,
+        "sha256": meta["sha256"],
+        "size": len(payload),
+        "source_fps": round(float(frame.get("source_fps") or 0.0), 1),
+    }
+
+
+def _streaming_video(camera_id: str, seconds: int) -> dict[str, Any]:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is not installed")
+
+    cfg = load_config()
+    fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
+    dt = now_local()
+    event_name = event_type or f"video_{seconds}s"
+    out_path = camera_day_dir(camera_id, dt) / make_filename(
+        camera_id,
+        event_name,
+        dt,
+        ".mp4",
+    )
+
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "mjpeg",
+        "-framerate", str(fps),
+        "-i", "pipe:0",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    started = time.monotonic()
+    last_seq = -1
+    frames_written = 0
+    error_text = ""
+
+    try:
+        while time.monotonic() - started < seconds:
+            if load_config().get("camera_mode") != "streaming":
+                raise RuntimeError("Streaming mode was stopped during recording")
+
+            frame = get_stream_frame(camera_id, max_age=3.0)
+            if frame is None:
+                time.sleep(0.03)
+                continue
+
+            seq = int(frame.get("seq") or 0)
+            if seq == last_seq:
+                time.sleep(0.01)
+                continue
+
+            last_seq = seq
+            payload = bytes(frame["frame"])
+            if proc.stdin is None:
+                raise RuntimeError("FFmpeg input pipe unavailable")
+            proc.stdin.write(payload)
+            frames_written += 1
+
+        if proc.stdin is not None:
+            proc.stdin.close()
+            proc.stdin = None
+
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise RuntimeError("FFmpeg did not finish after streaming video")
+
+        if proc.stderr is not None:
+            error_text = proc.stderr.read().decode("utf-8", errors="replace")[-2000:]
+
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    if (
+        proc.returncode != 0
+        or frames_written < 2
+        or not out_path.exists()
+        or out_path.stat().st_size == 0
+    ):
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Streaming video failed after {frames_written} frames: {error_text}"
+        )
+
+    meta = register_media(
+        out_path,
+        camera_id,
+        f"video_{seconds}s",
+        dt,
+        "shared_stream",
+    )
+    return {
+        "file": out_path.name,
+        "duration": seconds,
+        "frames": frames_written,
+        "fps": fps,
+        "size": out_path.stat().st_size,
+        "sha256": meta["sha256"],
+    }
+
+
+def _exclusive_camera_video(
+    camera_id: str,
+    seconds: int,
+    event_type: str | None = None,
+    source: str = "exclusive_mjpeg_ffmpeg",
+) -> dict[str, Any]:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not installed")
 
@@ -473,9 +789,9 @@ def _exclusive_camera_video(camera_id: str, seconds: int) -> dict[str, Any]:
     meta = register_media(
         out_path,
         camera_id,
-        f"video_{seconds}s",
+        event_name,
         dt,
-        "exclusive_mjpeg_ffmpeg",
+        source,
     )
 
     return {
@@ -507,19 +823,26 @@ def camera_operation_worker() -> None:
 
             try:
                 if item["kind"] == "photo":
-                    event_type = (
-                        "periodic"
-                        if item.get("origin") == "automatic"
-                        else "manual"
-                    )
                     result = _direct_camera_photo(
                         str(item["camera_id"]),
-                        event_type,
+                        "periodic",
                     )
-                elif item["kind"] == "video":
-                    result = _exclusive_camera_video(
+                elif item["kind"] == "stream_photo":
+                    result = _streaming_photo(
+                        str(item["camera_id"]),
+                    )
+                elif item["kind"] == "stream_video":
+                    result = _streaming_video(
                         str(item["camera_id"]),
                         max(1, int(item.get("duration") or 10)),
+                    )
+                elif item["kind"] == "alarm_video":
+                    seconds = max(1, int(item.get("duration") or 10))
+                    result = _exclusive_camera_video(
+                        str(item["camera_id"]),
+                        seconds,
+                        event_type=f"alarm_video_{seconds}s",
+                        source="alarm_triggered_stream",
                     )
                 else:
                     raise RuntimeError(
