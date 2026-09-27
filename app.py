@@ -36,7 +36,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.0.0")
+app = FastAPI(title="CamHub", version="1.0.1")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -688,11 +688,15 @@ def grouped_errors(
     )
 
     # Keep newest first inside the same severity.
+    def sort_timestamp(item: dict[str, Any]) -> float:
+        parsed = _parse_error_time(item.get("last_seen"))
+        return parsed.timestamp() if parsed else 0.0
+
     results = sorted(
         results,
         key=lambda item: (
             order.get(str(item.get("severity") or "info"), 9),
-            -(_parse_error_time(item.get("last_seen")) or datetime.min.astimezone()).timestamp(),
+            -sort_timestamp(item),
         ),
     )
     return results
