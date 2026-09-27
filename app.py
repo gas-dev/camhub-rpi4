@@ -1897,7 +1897,8 @@ async def upload_raw_image(
     dt = now_local()
     out_path = camera_day_dir(camera, dt) / make_filename(camera, event_type, dt, ".jpg")
     out_path.write_bytes(payload)
-    meta = register_media(out_path, camera, event_type, dt, "raw_jpeg")
+    source = "alarm_node_upload" if event_type == "alarm" else "raw_jpeg"
+    meta = register_media(out_path, camera, event_type, dt, source)
     return {"ok": True, "file": out_path.name, "relative": out_path.relative_to(DATA_DIR).as_posix(), "size": len(payload), "sha256": meta["sha256"]}
 
 
