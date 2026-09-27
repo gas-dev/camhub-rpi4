@@ -985,6 +985,11 @@ def automatic_snapshot_scheduler() -> None:
                 last_mode = "automatic"
 
             if now_mono >= automatic_next_due:
+                if ota_camera_busy(camera_id):
+                    automatic_next_due = now_mono + interval
+                    time.sleep(0.25)
+                    continue
+
                 with camera_operation_lock:
                     camera_idle = (
                         camera_operation_active is None
@@ -1581,6 +1586,12 @@ def get_config():
 @app.post("/api/config")
 def set_config(cfg: ConfigModel):
     data = cfg.model_dump()
+    target_camera_id = str(data.get("camera_id") or "CAM01")
+    if ota_camera_busy(target_camera_id):
+        raise HTTPException(
+            409,
+            "Camera firmware update is in progress; wait before changing configuration",
+        )
     if not 1 <= data["snapshot_interval_sec"] <= 86400:
         raise HTTPException(400, "snapshot_interval_sec must be 1..86400")
     if data["camera_mode"] == "manual":
@@ -1724,6 +1735,8 @@ async def node_alarm(
 
     payload = await request.json()
     camera_id = str(payload.get("camera_id") or cfg["camera_id"])
+    if ota_camera_busy(camera_id):
+        raise HTTPException(409, "Camera firmware update is in progress")
     seconds = max(
         1,
         min(
@@ -2255,6 +2268,12 @@ def set_camera_mode(mode: str):
     old_mode = str(cfg.get("camera_mode") or "automatic")
     camera_id = str(cfg.get("camera_id") or "CAM01")
 
+    if ota_camera_busy(camera_id):
+        raise HTTPException(
+            409,
+            "Camera firmware update is in progress",
+        )
+
     with camera_operation_lock:
         if camera_operation_active is not None:
             raise HTTPException(
@@ -2309,6 +2328,8 @@ def camera_queue():
 @app.post("/api/camera/{camera_id}/capture")
 def manual_capture(camera_id: str):
     cfg = load_config()
+    if ota_camera_busy(camera_id):
+        raise HTTPException(409, "Camera firmware update is in progress")
     if cfg.get("camera_mode") != "streaming":
         raise HTTPException(
             409,
@@ -2330,6 +2351,8 @@ def manual_capture(camera_id: str):
 @app.post("/api/camera/{camera_id}/record")
 def record_video(camera_id: str, duration: int | None = None):
     cfg = load_config()
+    if ota_camera_busy(camera_id):
+        raise HTTPException(409, "Camera firmware update is in progress")
     if cfg.get("camera_mode") != "streaming":
         raise HTTPException(
             409,
