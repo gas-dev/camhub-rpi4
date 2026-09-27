@@ -1631,8 +1631,22 @@ def set_config(cfg: ConfigModel):
     data = cfg.model_dump()
     if not 1 <= data["snapshot_interval_sec"] <= 86400:
         raise HTTPException(400, "snapshot_interval_sec must be 1..86400")
-    if data["camera_mode"] not in ("automatic", "manual"):
-        raise HTTPException(400, "camera_mode must be automatic or manual")
+    if data["camera_mode"] == "manual":
+        data["camera_mode"] = "streaming"
+    if data["camera_mode"] not in ("automatic", "streaming", "alarm"):
+        raise HTTPException(400, "camera_mode must be automatic, streaming or alarm")
+    if not 1 <= data["event_video_sec"] <= 60:
+        raise HTTPException(400, "event_video_sec must be 1..60")
+    if not 1 <= data["alarm_video_sec"] <= 60:
+        raise HTTPException(400, "alarm_video_sec must be 1..60")
+    if not 1 <= data["motion_threshold_pct"] <= 80:
+        raise HTTPException(400, "motion_threshold_pct must be 1..80")
+    if not 5 <= data["motion_pixel_delta"] <= 100:
+        raise HTTPException(400, "motion_pixel_delta must be 5..100")
+    if not 150 <= data["motion_sample_ms"] <= 5000:
+        raise HTTPException(400, "motion_sample_ms must be 150..5000")
+    if not 3 <= data["motion_cooldown_sec"] <= 300:
+        raise HTTPException(400, "motion_cooldown_sec must be 3..300")
     if not 1 <= data["event_video_sec"] <= 60:
         raise HTTPException(400, "event_video_sec must be 1..60")
     if data["camera_frame_size"] not in FRAME_SIZES:
@@ -1650,6 +1664,13 @@ def set_config(cfg: ConfigModel):
     for name in ("brightness", "contrast", "saturation"):
         if not -2 <= data[name] <= 2:
             raise HTTPException(400, f"{name} must be -2..2")
+    old_cfg = load_config()
+    old_mode = str(old_cfg.get("camera_mode") or "automatic")
+    camera_id = str(data.get("camera_id") or "CAM01")
+
+    if old_mode == "streaming":
+        stop_streaming_mode(camera_id)
+
     save_config(data)
     if data.get("drive_enabled"):
         queue_cloud_sync()
@@ -1660,6 +1681,10 @@ def set_config(cfg: ConfigModel):
         camera_applied, camera_message = push_config_to_node(data["camera_id"], data)
     except Exception as exc:
         camera_message = str(exc)
+
+    if data.get("camera_mode") == "streaming" and camera_applied:
+        time.sleep(0.25)
+        start_streaming_mode(camera_id)
 
     return {
         "ok": True,
@@ -1677,6 +1702,12 @@ def node_config(camera_id: str, x_cam_token: str | None = Header(default=None)):
         "camera_id": camera_id,
         "snapshot_interval_sec": cfg["snapshot_interval_sec"],
         "snapshot_source": "server_exclusive_queue",
+        "camera_mode": cfg["camera_mode"],
+        "alarm_video_sec": cfg["alarm_video_sec"],
+        "motion_threshold_pct": cfg["motion_threshold_pct"],
+        "motion_pixel_delta": cfg["motion_pixel_delta"],
+        "motion_sample_ms": cfg["motion_sample_ms"],
+        "motion_cooldown_sec": cfg["motion_cooldown_sec"],
         "camera_frame_size": cfg["camera_frame_size"],
         "jpeg_quality": cfg["jpeg_quality"],
         "horizontal_mirror": cfg["horizontal_mirror"],
@@ -1726,6 +1757,60 @@ async def node_heartbeat(request: Request, x_cam_token: str | None = Header(defa
     save_node(camera_id, payload)
     return {"ok": True}
 
+@app.post("/api/node/alarm")
+async def node_alarm(
+    request: Request,
+    x_cam_token: str | None = Header(default=None),
+):
+    cfg = load_config()
+    if x_cam_token != cfg["upload_token"]:
+        raise HTTPException(401, "Invalid camera token")
+    if cfg.get("camera_mode") != "alarm":
+        raise HTTPException(409, "CamHub is not in alarm mode")
+
+    payload = await request.json()
+    camera_id = str(payload.get("camera_id") or cfg["camera_id"])
+    seconds = max(
+        1,
+        min(
+            int(payload.get("video_sec") or cfg.get("alarm_video_sec", 10)),
+            60,
+        ),
+    )
+
+    now_mono = time.monotonic()
+    last = float(alarm_last_event.get(camera_id) or 0.0)
+    if now_mono - last < 3.0:
+        return {
+            "ok": True,
+            "deduplicated": True,
+            "message": "Alarm already received recently",
+        }
+
+    alarm_last_event[camera_id] = now_mono
+    item = enqueue_camera_operation(
+        "alarm_video",
+        camera_id,
+        duration=seconds,
+        origin="alarm",
+        priority=True,
+    )
+
+    record_runtime_error(
+        "alarm_trigger",
+        (
+            f"Motion alarm received. Video {seconds}s queued as "
+            f"operation #{item['id']}."
+        ),
+        camera_id,
+    )
+
+    return {
+        "ok": True,
+        "deduplicated": False,
+        "operation": item,
+    }
+
 
 @app.get("/api/nodes")
 def api_nodes():
@@ -1736,7 +1821,12 @@ def api_nodes():
             node = json.loads(path.read_text(encoding="utf-8"))
             seen = datetime.fromisoformat(node["last_seen"])
             node["online"] = (now - seen).total_seconds() < 45
-            node["ingest_fps"] = 0.0
+            stream_state = streaming_mode_status(
+                str(node.get("camera_id") or "")
+            )
+            node["ingest_fps"] = stream_state["source_fps"]
+            node["stream_running"] = stream_state["running"]
+            node["stream_frame_available"] = stream_state["frame_available"]
             nodes.append(node)
         except Exception:
             continue
@@ -1807,7 +1897,8 @@ def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]
     try:
         base = _node_url(camera_id, "control_url", "/control")
         query = (
-            f"?mirror={1 if cfg['horizontal_mirror'] else 0}"
+            f"?mode={cfg['camera_mode']}"
+            f"&mirror={1 if cfg['horizontal_mirror'] else 0}"
             f"&flip={1 if cfg['vertical_flip'] else 0}"
             f"&frame={cfg['camera_frame_size']}"
             f"&quality={cfg['jpeg_quality']}"
@@ -1816,6 +1907,11 @@ def push_config_to_node(camera_id: str, cfg: dict[str, Any]) -> tuple[bool, str]
             f"&saturation={cfg['saturation']}"
             f"&fps={cfg['stream_max_fps']}"
             f"&interval={cfg['snapshot_interval_sec']}"
+            f"&alarm_video={cfg['alarm_video_sec']}"
+            f"&motion_pct={cfg['motion_threshold_pct']}"
+            f"&motion_delta={cfg['motion_pixel_delta']}"
+            f"&motion_ms={cfg['motion_sample_ms']}"
+            f"&motion_cooldown={cfg['motion_cooldown_sec']}"
         )
         req = urllib.request.Request(base + query, headers={"User-Agent": "CamHub/0.4.1"})
         with urllib.request.urlopen(req, timeout=8) as response:
@@ -1830,43 +1926,56 @@ def set_camera_mode(mode: str):
     global automatic_next_due
 
     normalized = mode.strip().lower()
-    if normalized not in ("automatic", "manual"):
-        raise HTTPException(400, "Mode must be automatic or manual")
+    if normalized == "manual":
+        normalized = "streaming"
+    if normalized not in ("automatic", "streaming", "alarm"):
+        raise HTTPException(
+            400,
+            "Mode must be automatic, streaming or alarm",
+        )
 
     cfg = load_config()
+    camera_id = str(cfg.get("camera_id") or "CAM01")
+
+    with camera_operation_lock:
+        if camera_operation_active is not None:
+            raise HTTPException(
+                409,
+                "Wait for the current camera operation to finish before changing mode",
+            )
+
+    stop_streaming_mode(camera_id)
+
+    with camera_operation_lock:
+        cancelled = len(camera_operation_queue)
+        camera_operation_queue.clear()
+
     cfg["camera_mode"] = normalized
     save_config(cfg)
 
-    cancelled = 0
-    if normalized == "manual":
-        automatic_next_due = 0.0
-        with camera_operation_lock:
-            retained = [
-                item
-                for item in camera_operation_queue
-                if item.get("origin") != "automatic"
-            ]
-            cancelled = len(camera_operation_queue) - len(retained)
-            camera_operation_queue.clear()
-            camera_operation_queue.extend(retained)
-    else:
-        with camera_operation_lock:
-            retained = [
-                item
-                for item in camera_operation_queue
-                if item.get("origin") == "automatic"
-            ]
-            cancelled = len(camera_operation_queue) - len(retained)
-            camera_operation_queue.clear()
-            camera_operation_queue.extend(retained)
-
+    if normalized == "automatic":
         automatic_next_due = (
             time.monotonic()
             + max(1, int(cfg.get("snapshot_interval_sec", 60)))
         )
+    else:
+        automatic_next_due = 0.0
+
+    applied, message = push_config_to_node(camera_id, cfg)
+    if not applied:
+        raise HTTPException(
+            503,
+            f"Camera mode saved but node did not apply it: {message}",
+        )
+
+    if normalized == "streaming":
+        time.sleep(0.3)
+        start_streaming_mode(camera_id)
 
     result = camera_operation_status()
     result["cancelled_queued_from_previous_mode"] = cancelled
+    result["camera_applied"] = applied
+    result["camera_message"] = message
     return result
 
 
@@ -1878,16 +1987,16 @@ def camera_queue():
 @app.post("/api/camera/{camera_id}/capture")
 def manual_capture(camera_id: str):
     cfg = load_config()
-    if cfg.get("camera_mode") != "manual":
+    if cfg.get("camera_mode") != "streaming":
         raise HTTPException(
             409,
-            "Camera is in automatic mode. Switch to manual mode before requesting a photo.",
+            "Photo is available only in streaming mode.",
         )
 
     item = enqueue_camera_operation(
-        "photo",
+        "stream_photo",
         camera_id,
-        origin="manual",
+        origin="streaming",
     )
     return {
         "ok": True,
@@ -1899,18 +2008,18 @@ def manual_capture(camera_id: str):
 @app.post("/api/camera/{camera_id}/record")
 def record_video(camera_id: str, duration: int | None = None):
     cfg = load_config()
-    if cfg.get("camera_mode") != "manual":
+    if cfg.get("camera_mode") != "streaming":
         raise HTTPException(
             409,
-            "Camera is in automatic mode. Switch to manual mode before requesting a video.",
+            "Manual video is available only in streaming mode.",
         )
 
     seconds = max(1, min(int(duration or cfg["event_video_sec"]), 60))
     item = enqueue_camera_operation(
-        "video",
+        "stream_video",
         camera_id,
         duration=seconds,
-        origin="manual",
+        origin="streaming",
     )
     return {
         "ok": True,
@@ -1921,10 +2030,44 @@ def record_video(camera_id: str, duration: int | None = None):
 
 @app.get("/api/camera/{camera_id}/live")
 def live_proxy(camera_id: str):
-    raise HTTPException(
-        409,
-        "Continuous live streaming is disabled in exclusive camera mode. "
-        "Use automatic snapshots or queue a manual photo/video.",
+    cfg = load_config()
+    if cfg.get("camera_mode") != "streaming":
+        raise HTTPException(
+            409,
+            "Live view is available only in streaming mode.",
+        )
+
+    start_streaming_mode(camera_id)
+
+    def generate():
+        last_seq = -1
+
+        while load_config().get("camera_mode") == "streaming":
+            frame = get_stream_frame(camera_id, max_age=5.0)
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            seq = int(frame.get("seq") or 0)
+            if seq == last_seq:
+                time.sleep(0.02)
+                continue
+
+            last_seq = seq
+            payload = bytes(frame["frame"])
+
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+                + payload
+                + b"\r\n"
+            )
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
 
@@ -1993,6 +2136,7 @@ def api_status():
         "drive_custom_oauth": has_custom_drive_oauth(str(cfg.get("drive_remote") or "gdrive")),
         "camera_mode": cfg.get("camera_mode", "automatic"),
         "camera_queue": camera_operation_status(),
+        "streaming": streaming_mode_status(str(cfg.get("camera_id") or "CAM01")),
         "latest_name": latest.name if latest else None,
         "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
     }
