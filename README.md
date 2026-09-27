@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.0.1
+## Current version: 1.0.2
 
 Architecture:
 
@@ -488,3 +488,27 @@ The Debug page includes subsystem and severity filters, repeat counts, first/las
 The Media page hides diagnostic .txt entries so normal evidence/media browsing is not cluttered by technical logs.
 
 “Pulisci vista” stores a local cutoff timestamp in error-state.json and clears the in-memory runtime feed. It does not delete media, manifests or historical diagnostic files. Older entries can still be inspected by enabling “mostra anche puliti”.
+
+
+## CamHub 1.0.2 permanent acquisition markers
+
+Saved still images now receive a small permanent color dot in the top-right corner before archival and SHA-256 registration.
+
+Marker legend:
+
+    BLUE   #2F80ED  Automatico / periodic
+    GREEN  #27AE60  Streaming / manual still
+    RED    #EB5757  Allarme
+
+The marker is burned into the saved JPEG itself; it is not a browser/dashboard overlay. Therefore the acquisition mode remains visible if the image is copied, exported, opened years later, or viewed without CamHub.
+
+The marker is intentionally small and its radius scales with image resolution.
+
+For provenance, the manifest stores both:
+
+    source_sha256_before_marker
+    final media sha256
+
+and also records acquisition_mode plus marker position/color. The normal media SHA-256 is calculated after the marker has been applied, so the archived visible file and its integrity hash always correspond.
+
+Marker rendering is performed by CamHub rather than the ESP32 camera firmware. This avoids adding JPEG decode/re-encode memory pressure to the ESP32-CAM while producing the same permanent visual result in the archived file.
