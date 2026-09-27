@@ -66,7 +66,7 @@ th,td{padding:9px 8px;text-align:left;border-bottom:1px solid var(--border);vert
 th{color:var(--muted);font-weight:600}
 .scroll{overflow:auto}
 .mono{font-family:Consolas,monospace;word-break:break-all}
-.notice{padding:11px 12px;border:1px solid var(--border);border-radius:9px;background:#101722;margin:10px 0}
+.notice{padding:11px 12px;border:1px solid var(--border);border-radius:9px;background:#101722;margin:10px 0}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 5px 0 12px;vertical-align:middle;border:1px solid #111}.legend-dot:first-child{margin-left:0}
 .progress{height:8px;background:#0c1117;border-radius:99px;overflow:hidden;min-width:120px}
 .progress>div{height:100%;background:var(--accent);width:0}
 .section-tabs{display:none}
@@ -145,6 +145,7 @@ th{color:var(--muted);font-weight:600}
 
         <div class="card full">
           <h2>Ultima immagine archiviata</h2>
+          <div class="muted" style="margin-bottom:8px"><span class="legend-dot" style="background:#2F80ED"></span>Automatico <span class="legend-dot" style="background:#27AE60"></span>Streaming/manuale <span class="legend-dot" style="background:#EB5757"></span>Allarme</div>
           <img id="latest" class="latest" alt="Nessuna immagine">
           <div id="latestInfo" class="muted" style="margin-top:8px"></div>
         </div>
@@ -153,6 +154,13 @@ th{color:var(--muted);font-weight:600}
 
     <section id="page-media" class="section">
       <div class="pagehead"><div><h1>Media</h1><div class="muted">Foto, video, eventi allarme e integrità SHA-256</div></div></div>
+      <div class="notice muted">
+        Indicatore permanente sulle immagini:
+        <span class="legend-dot" style="background:#2F80ED"></span>blu = Automatico
+        <span class="legend-dot" style="background:#27AE60"></span>verde = Streaming/manuale
+        <span class="legend-dot" style="background:#EB5757"></span>rosso = Allarme.
+        Il punto è incorporato nel JPEG salvato, non è un elemento della dashboard.
+      </div>
       <div class="card full scroll">
         <table>
           <thead><tr><th>Ora</th><th>Tipo</th><th>Evento</th><th>File</th><th>Dimensione</th><th>Cloud</th><th>SHA-256</th></tr></thead>
