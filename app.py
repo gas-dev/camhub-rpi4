@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.0.3")
+app = FastAPI(title="CamHub", version="1.1.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -1216,12 +1216,416 @@ def _streaming_photo(camera_id: str) -> dict[str, Any]:
     }
 
 
-def _streaming_video(camera_id: str, seconds: int) -> dict[str, Any]:
+def _set_recording_progress(
+    target_sec: int,
+    started_mono: float,
+    frames: int,
+    bytes_captured: int,
+) -> None:
+    elapsed = max(0.0, time.monotonic() - started_mono)
+    remaining = max(0.0, float(target_sec) - elapsed)
+    actual_fps = frames / elapsed if elapsed > 0 else 0.0
+
+    with camera_operation_lock:
+        if camera_operation_active is None:
+            return
+        camera_operation_active["progress_pct"] = min(
+            99,
+            int((elapsed * 100.0) / max(1, target_sec)),
+        )
+        camera_operation_active["elapsed_sec"] = round(elapsed, 1)
+        camera_operation_active["remaining_sec"] = round(remaining, 1)
+        camera_operation_active["frames"] = frames
+        camera_operation_active["capture_fps"] = round(actual_fps, 2)
+        camera_operation_active["capture_bytes"] = bytes_captured
+
+
+def _probe_video_duration(path: Path) -> float | None:
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        value = float((result.stdout or "").strip())
+        return value if value >= 0 else None
+    except Exception:
+        return None
+
+
+def _encode_mjpeg_spool(
+    spool_path: Path,
+    out_path: Path,
+    frame_count: int,
+    capture_duration_sec: float,
+) -> tuple[float, float | None]:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not installed")
+    if frame_count < 2:
+        raise RuntimeError(
+            f"Video capture produced only {frame_count} frame(s)"
+        )
+    if capture_duration_sec <= 0:
+        raise RuntimeError("Invalid video capture duration")
 
+    # FPS here is a measurement, not a requested playback rate.
+    # frames / wall-clock duration guarantees that the MP4 duration follows
+    # real elapsed capture time rather than the configured FPS ceiling.
+    actual_fps = frame_count / capture_duration_sec
+    input_fps = max(0.05, actual_fps)
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-f", "mjpeg",
+        "-framerate", f"{input_fps:.8f}",
+        "-i", str(spool_path),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    timeout = max(
+        60,
+        min(
+            1800,
+            int(capture_duration_sec * 1.5) + 60,
+        ),
+    )
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError("FFmpeg video encoding timed out") from exc
+
+    if (
+        result.returncode != 0
+        or not out_path.exists()
+        or out_path.stat().st_size == 0
+    ):
+        out_path.unlink(missing_ok=True)
+        detail = (
+            result.stderr
+            or result.stdout
+            or "unknown ffmpeg error"
+        )[-3000:]
+        raise RuntimeError("Video encoding failed: " + detail)
+
+    return actual_fps, _probe_video_duration(out_path)
+
+
+def _spool_shared_stream(
+    camera_id: str,
+    seconds: int,
+    spool_path: Path,
+) -> tuple[int, int, float]:
+    started = time.monotonic()
+    deadline = started + seconds
+    last_seq = -1
+    frame_count = 0
+    bytes_captured = 0
+    last_frame_at = started
+    last_progress_at = 0.0
+    free_at_start = shutil.disk_usage(BASE_DIR).free
+
+    with spool_path.open("wb") as spool:
+        while True:
+            now_mono = time.monotonic()
+            if now_mono >= deadline:
+                break
+
+            if load_config().get("camera_mode") != "streaming":
+                raise RuntimeError(
+                    "Streaming mode was stopped during recording"
+                )
+
+            frame = get_stream_frame(camera_id, max_age=5.0)
+            if frame is None:
+                if now_mono - last_frame_at > 8.0:
+                    raise RuntimeError(
+                        "No camera frames received for more than 8 seconds"
+                    )
+                time.sleep(0.03)
+                continue
+
+            seq = int(frame.get("seq") or 0)
+            if seq == last_seq:
+                time.sleep(0.01)
+                continue
+
+            payload = bytes(frame["frame"])
+            if len(payload) < 4:
+                continue
+
+            last_seq = seq
+            spool.write(payload)
+            frame_count += 1
+            bytes_captured += len(payload)
+            last_frame_at = now_mono
+
+            elapsed = max(0.001, now_mono - started)
+
+            # For long recordings, reject early if the current MJPEG data rate
+            # indicates that temporary spool + final MP4 cannot fit safely.
+            if elapsed >= 5.0 and frame_count >= 5:
+                bytes_per_sec = bytes_captured / elapsed
+                projected_spool = bytes_per_sec * seconds
+                projected_working_set = int(projected_spool * 1.75)
+                reserve = 256 * 1024 * 1024
+                if projected_working_set + reserve > free_at_start:
+                    raise RuntimeError(
+                        "Insufficient disk space for requested video: "
+                        f"estimated working set "
+                        f"{projected_working_set / 1024 / 1024:.0f} MB, "
+                        f"free {free_at_start / 1024 / 1024:.0f} MB"
+                    )
+
+            if now_mono - last_progress_at >= 1.0:
+                _set_recording_progress(
+                    seconds,
+                    started,
+                    frame_count,
+                    bytes_captured,
+                )
+                last_progress_at = now_mono
+
+    ended = time.monotonic()
+    capture_duration = max(0.001, ended - started)
+    _set_recording_progress(
+        seconds,
+        started,
+        frame_count,
+        bytes_captured,
+    )
+    return frame_count, bytes_captured, capture_duration
+
+
+def _spool_direct_mjpeg_stream(
+    camera_id: str,
+    seconds: int,
+    spool_path: Path,
+) -> tuple[int, int, float]:
+    stream_url = _node_url(camera_id, "stream_url", "/stream")
+    request = urllib.request.Request(
+        stream_url,
+        headers={
+            "User-Agent": "CamHub/1.1-video",
+            "Connection": "close",
+        },
+    )
+
+    started = time.monotonic()
+    deadline = started + seconds
+    frame_count = 0
+    bytes_captured = 0
+    buffer = b""
+    last_frame_at = started
+    last_progress_at = 0.0
+    free_at_start = shutil.disk_usage(BASE_DIR).free
+
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            with spool_path.open("wb") as spool:
+                while True:
+                    now_mono = time.monotonic()
+                    if now_mono >= deadline:
+                        break
+
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+
+                    buffer += chunk
+
+                    while True:
+                        start = buffer.find(b"\xff\xd8")
+                        if start < 0:
+                            if len(buffer) > 2:
+                                buffer = buffer[-2:]
+                            break
+
+                        end = buffer.find(b"\xff\xd9", start + 2)
+                        if end < 0:
+                            if start > 0:
+                                buffer = buffer[start:]
+                            if len(buffer) > 8 * 1024 * 1024:
+                                buffer = b""
+                            break
+
+                        payload = buffer[start:end + 2]
+                        buffer = buffer[end + 2:]
+
+                        if len(payload) <= 1024:
+                            continue
+
+                        spool.write(payload)
+                        frame_count += 1
+                        bytes_captured += len(payload)
+                        last_frame_at = time.monotonic()
+
+                    elapsed = max(0.001, time.monotonic() - started)
+                    if elapsed >= 5.0 and frame_count >= 5:
+                        bytes_per_sec = bytes_captured / elapsed
+                        projected_spool = bytes_per_sec * seconds
+                        projected_working_set = int(projected_spool * 1.75)
+                        reserve = 256 * 1024 * 1024
+                        if projected_working_set + reserve > free_at_start:
+                            raise RuntimeError(
+                                "Insufficient disk space for requested alarm "
+                                "video"
+                            )
+
+                    now_mono = time.monotonic()
+                    if now_mono - last_progress_at >= 1.0:
+                        _set_recording_progress(
+                            seconds,
+                            started,
+                            frame_count,
+                            bytes_captured,
+                        )
+                        last_progress_at = now_mono
+
+                    if now_mono - last_frame_at > 8.0:
+                        raise RuntimeError(
+                            "No camera frames received for more than 8 seconds"
+                        )
+
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"Camera MJPEG HTTP {exc.code}: {detail or exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Camera MJPEG connection error: {exc}"
+        ) from exc
+
+    ended = time.monotonic()
+    capture_duration = max(0.001, ended - started)
+    _set_recording_progress(
+        seconds,
+        started,
+        frame_count,
+        bytes_captured,
+    )
+    return frame_count, bytes_captured, capture_duration
+
+
+def _finalize_recorded_video(
+    camera_id: str,
+    seconds: int,
+    dt: datetime,
+    out_path: Path,
+    spool_path: Path,
+    frame_count: int,
+    bytes_captured: int,
+    capture_duration: float,
+    event_name: str,
+    source: str,
+    requested_fps: int,
+) -> dict[str, Any]:
+    actual_fps, encoded_duration = _encode_mjpeg_spool(
+        spool_path,
+        out_path,
+        frame_count,
+        capture_duration,
+    )
+
+    duration_error = (
+        abs(encoded_duration - capture_duration)
+        if encoded_duration is not None
+        else None
+    )
+
+    extra = {
+        "requested_duration_sec": seconds,
+        "capture_duration_sec": round(capture_duration, 3),
+        "encoded_duration_sec": (
+            round(encoded_duration, 3)
+            if encoded_duration is not None
+            else None
+        ),
+        "duration_error_sec": (
+            round(duration_error, 3)
+            if duration_error is not None
+            else None
+        ),
+        "requested_fps_ceiling": requested_fps,
+        "measured_capture_fps": round(actual_fps, 4),
+        "captured_frames": frame_count,
+        "captured_mjpeg_bytes": bytes_captured,
+        "timing_model": "wall_clock_duration_measured_fps",
+    }
+
+    meta = register_media(
+        out_path,
+        camera_id,
+        event_name,
+        dt,
+        source,
+        extra,
+    )
+
+    with camera_operation_lock:
+        if camera_operation_active is not None:
+            camera_operation_active["progress_pct"] = 100
+            camera_operation_active["elapsed_sec"] = round(
+                capture_duration,
+                1,
+            )
+            camera_operation_active["remaining_sec"] = 0.0
+            camera_operation_active["frames"] = frame_count
+            camera_operation_active["capture_fps"] = round(
+                actual_fps,
+                2,
+            )
+
+    return {
+        "file": out_path.name,
+        "requested_duration": seconds,
+        "capture_duration": round(capture_duration, 3),
+        "encoded_duration": (
+            round(encoded_duration, 3)
+            if encoded_duration is not None
+            else None
+        ),
+        "frames": frame_count,
+        "measured_fps": round(actual_fps, 4),
+        "requested_fps_ceiling": requested_fps,
+        "size": out_path.stat().st_size,
+        "sha256": meta["sha256"],
+    }
+
+
+def _streaming_video(camera_id: str, seconds: int) -> dict[str, Any]:
     cfg = load_config()
-    fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
+    requested_fps = max(
+        1,
+        min(int(cfg.get("stream_max_fps", 5)), 15),
+    )
+    seconds = max(1, min(int(seconds), 3600))
     dt = now_local()
     event_name = f"video_{seconds}s"
     out_path = camera_day_dir(camera_id, dt) / make_filename(
@@ -1231,112 +1635,55 @@ def _streaming_video(camera_id: str, seconds: int) -> dict[str, Any]:
         ".mp4",
     )
 
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "mjpeg",
-        "-framerate", str(fps),
-        "-i", "pipe:0",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(out_path),
-    ]
-
-    proc = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-
-    started = time.monotonic()
-    last_seq = -1
-    frames_written = 0
-    error_text = ""
+    with tempfile.NamedTemporaryFile(
+        prefix=f"camhub_{camera_id}_",
+        suffix=".mjpg",
+        dir=str(BASE_DIR),
+        delete=False,
+    ) as temp:
+        spool_path = Path(temp.name)
 
     try:
-        while time.monotonic() - started < seconds:
-            if load_config().get("camera_mode") != "streaming":
-                raise RuntimeError("Streaming mode was stopped during recording")
-
-            frame = get_stream_frame(camera_id, max_age=3.0)
-            if frame is None:
-                time.sleep(0.03)
-                continue
-
-            seq = int(frame.get("seq") or 0)
-            if seq == last_seq:
-                time.sleep(0.01)
-                continue
-
-            last_seq = seq
-            payload = bytes(frame["frame"])
-            if proc.stdin is None:
-                raise RuntimeError("FFmpeg input pipe unavailable")
-            proc.stdin.write(payload)
-            frames_written += 1
-
-        if proc.stdin is not None:
-            proc.stdin.close()
-            proc.stdin = None
-
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-            raise RuntimeError("FFmpeg did not finish after streaming video")
-
-        if proc.stderr is not None:
-            error_text = proc.stderr.read().decode("utf-8", errors="replace")[-2000:]
-
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-
-    if (
-        proc.returncode != 0
-        or frames_written < 2
-        or not out_path.exists()
-        or out_path.stat().st_size == 0
-    ):
-        out_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"Streaming video failed after {frames_written} frames: {error_text}"
+        frame_count, bytes_captured, capture_duration = (
+            _spool_shared_stream(
+                camera_id,
+                seconds,
+                spool_path,
+            )
         )
 
-    meta = register_media(
-        out_path,
-        camera_id,
-        f"video_{seconds}s",
-        dt,
-        "shared_stream",
-    )
-    return {
-        "file": out_path.name,
-        "duration": seconds,
-        "frames": frames_written,
-        "fps": fps,
-        "size": out_path.stat().st_size,
-        "sha256": meta["sha256"],
-    }
+        return _finalize_recorded_video(
+            camera_id,
+            seconds,
+            dt,
+            out_path,
+            spool_path,
+            frame_count,
+            bytes_captured,
+            capture_duration,
+            event_name,
+            "shared_stream_wallclock",
+            requested_fps,
+        )
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+    finally:
+        spool_path.unlink(missing_ok=True)
 
 
 def _exclusive_camera_video(
     camera_id: str,
     seconds: int,
     event_type: str | None = None,
-    source: str = "exclusive_mjpeg_ffmpeg",
+    source: str = "alarm_triggered_stream",
 ) -> dict[str, Any]:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg is not installed")
-
     cfg = load_config()
-    requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
-    stream_url = _node_url(camera_id, "stream_url", "/stream")
+    requested_fps = max(
+        1,
+        min(int(cfg.get("stream_max_fps", 5)), 15),
+    )
+    seconds = max(1, min(int(seconds), 600))
     dt = now_local()
     event_name = event_type or f"video_{seconds}s"
     out_path = camera_day_dir(camera_id, dt) / make_filename(
@@ -1346,59 +1693,41 @@ def _exclusive_camera_video(
         ".mp4",
     )
 
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
-        "-use_wallclock_as_timestamps", "1",
-        "-i", stream_url,
-        "-t", str(seconds),
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-r", str(requested_fps),
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(out_path),
-    ]
+    with tempfile.NamedTemporaryFile(
+        prefix=f"camhub_{camera_id}_alarm_",
+        suffix=".mjpg",
+        dir=str(BASE_DIR),
+        delete=False,
+    ) as temp:
+        spool_path = Path(temp.name)
 
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=max(45, seconds + 35),
+        frame_count, bytes_captured, capture_duration = (
+            _spool_direct_mjpeg_stream(
+                camera_id,
+                seconds,
+                spool_path,
+            )
         )
-    except subprocess.TimeoutExpired as exc:
+
+        return _finalize_recorded_video(
+            camera_id,
+            seconds,
+            dt,
+            out_path,
+            spool_path,
+            frame_count,
+            bytes_captured,
+            capture_duration,
+            event_name,
+            source,
+            requested_fps,
+        )
+    except Exception:
         out_path.unlink(missing_ok=True)
-        raise RuntimeError("Video recording timed out") from exc
-
-    if (
-        result.returncode != 0
-        or not out_path.exists()
-        or out_path.stat().st_size == 0
-    ):
-        out_path.unlink(missing_ok=True)
-        detail = (result.stderr or result.stdout or "unknown ffmpeg error")[-2000:]
-        raise RuntimeError("Video recording failed: " + detail)
-
-    meta = register_media(
-        out_path,
-        camera_id,
-        event_name,
-        dt,
-        source,
-    )
-
-    return {
-        "file": out_path.name,
-        "duration": seconds,
-        "requested_fps": requested_fps,
-        "resolution": cfg.get("camera_frame_size"),
-        "size": out_path.stat().st_size,
-        "sha256": meta["sha256"],
-    }
+        raise
+    finally:
+        spool_path.unlink(missing_ok=True)
 
 
 def camera_operation_worker() -> None:
@@ -2234,8 +2563,8 @@ def set_config(cfg: ConfigModel):
         data["camera_mode"] = "streaming"
     if data["camera_mode"] not in ("automatic", "streaming", "alarm"):
         raise HTTPException(400, "camera_mode must be automatic, streaming or alarm")
-    if not 1 <= data["event_video_sec"] <= 60:
-        raise HTTPException(400, "event_video_sec must be 1..60")
+    if not 1 <= data["event_video_sec"] <= 3600:
+        raise HTTPException(400, "event_video_sec must be 1..3600")
     if not 1 <= data["alarm_video_sec"] <= 60:
         raise HTTPException(400, "alarm_video_sec must be 1..60")
     if not 1 <= data["motion_threshold_pct"] <= 80:
@@ -3106,7 +3435,10 @@ def record_video(camera_id: str, duration: int | None = None):
             "Manual video is available only in streaming mode.",
         )
 
-    seconds = max(1, min(int(duration or cfg["event_video_sec"]), 60))
+    seconds = max(
+        1,
+        min(int(duration or cfg["event_video_sec"]), 3600),
+    )
     item = enqueue_camera_operation(
         "stream_video",
         camera_id,
