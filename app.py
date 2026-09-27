@@ -179,6 +179,8 @@ def load_config() -> dict[str, Any]:
                 existing = {}
         if "camera_frame_size" not in existing and existing.get("event_video_sec") == 30:
             existing["event_video_sec"] = 10
+        if existing.get("camera_mode") == "manual":
+            existing["camera_mode"] = "streaming"
         merged = {**DEFAULT_CONFIG, **existing}
         if merged != existing:
             save_config(merged)
