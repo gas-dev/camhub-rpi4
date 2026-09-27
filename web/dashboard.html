@@ -437,6 +437,13 @@ async function refresh(){
         (n.health_baseline_initialized===false?' · <span class="muted">baseline diagnostica inizializzata</span>':'')+'<br>'+
         'Wi-Fi: '+esc(n.rssi??'')+' dBm · '+esc(n.wifi_quality_pct??'—')+'% · driver '+esc(n.driver_mode||'')+'<br>'+
         'Heap: '+fmtBytes(n.free_heap)+' · minimo '+fmtBytes(n.min_free_heap)+' · PSRAM '+fmtBytes(n.free_psram)+'<br>'+
+        'Pipeline: '+(n.camera_pipeline_healthy===false?'<span class="bad"><b>RECOVERY</b></span>':'<span class="ok">OK</span>')+
+        ' · Dropout '+esc(n.stream_frame_dropouts??0)+
+        ' · recuperati '+esc(n.stream_recovered_dropouts??0)+
+        ' · fatal '+esc(n.stream_fatal_failures??0)+'<br>'+
+        'Power-cycle sensore: '+esc(n.sensor_power_cycles??0)+
+        ' · riparazioni background '+esc(n.background_repairs??0)+
+        ' · fallite '+esc(n.background_repair_failures??0)+'<br>'+
         'Motion: '+esc(n.motion_hits??0)+' / '+esc(n.motion_samples??0)+' · Allarmi: '+esc(n.alarm_triggers??0);
     }else{
       document.getElementById('topOnline').innerHTML='<span class="bad">● CAMERA NON PRESENTE</span>';
