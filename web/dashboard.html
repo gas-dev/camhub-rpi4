@@ -450,6 +450,8 @@ async function refresh(){
         'Driver camera: '+(driverOn?'<span class="ok">ON</span>':'OFF')+' · pipeline: '+(cameraReady?'<span class="ok">READY</span>':(active==='standby'?'<span class="muted">SPENTA</span>':'<span class="warn">NON PRONTA</span>'))+'<br>'+
         'Ultimo frame nodo: '+(latestAge>=0?latestAge+' ms fa':'—')+' · seq '+esc(n.latest_frame_seq??0)+' · ingest Raspberry '+Number(n.ingest_fps||0).toFixed(1)+' fps · '+(n.stream_frame_available?'<span class="ok">FRAME OK</span>':'nessun frame')+'<br>'+
         'Frame camera: '+esc(n.frame_capture_success??n.capture_success??0)+' / '+esc(n.frame_capture_attempts??n.capture_requests??0)+' · falliti '+esc(n.frame_capture_failures??n.camera_fb_get_failures??0)+'<br>'+
+        'JPEG: ultimo '+fmtBytes(n.last_jpeg_bytes||0)+' · max '+fmtBytes(n.max_jpeg_bytes_seen||0)+' · oversize '+esc(n.oversize_jpeg_frames??0)+' · acquisizione '+esc(n.last_capture_duration_ms??0)+' ms (max '+esc(n.max_capture_duration_ms??0)+' ms)<br>'+
+        'XCLK camera: '+(n.camera_xclk_hz?Number(n.camera_xclk_hz/1000000).toFixed(0)+' MHz':'—')+' · buffer stream ESP '+esc(n.stream_copy_buffers??'—')+'<br>'+
         'Recovery: '+esc(n.camera_recoveries??n.driver_recoveries??0)+' · falliti '+esc(n.camera_recovery_failures??n.driver_recovery_failures??0)+' · power-cycle '+esc(n.sensor_power_cycles??0)+'<br>'+
         'Config rev: desiderata '+esc(n.config_revision_desired??'—')+' · attiva '+esc(n.config_revision_active??'—')+'<br>'+
         'Wi-Fi: '+esc(n.rssi??'')+' dBm · '+esc(n.wifi_quality_pct??'—')+'% · heap '+fmtBytes(n.free_heap)+' · minimo '+fmtBytes(n.min_free_heap)+' · PSRAM '+fmtBytes(n.free_psram)+
