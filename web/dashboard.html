@@ -639,9 +639,11 @@ async function refreshFirmware(){
       const p=Math.max(0,Math.min(100,Number(j?.progress_pct||0)));
       const capable=cam.ota_capable;
       const current=m&&cam.firmware===m.version;
-      const otaActive=!!(j&&['requested','preparing','downloading','verifying','rebooting','waiting_heartbeat'].includes(j.state));
-      const startup=cam.service_ready===false;
-      const recovery=cam.camera_pipeline_healthy===false;
+      const otaActive=!!(j&&['entering_standby','requested','preparing','downloading','verifying','rebooting','waiting_heartbeat','restoring_mode'].includes(j.state));
+      const nodeState=String(cam.state||'legacy');
+      const activeMode=String(cam.active_mode||'');
+      const startup=['booting','transition'].includes(nodeState);
+      const recovery=['recovering','error'].includes(nodeState);
       const maintenance=!!cam.maintenance_active;
       const actionParts=[];
       if(!capable)actionParts.push('<span class="warn">USB iniziale richiesto</span>');
@@ -656,9 +658,9 @@ async function refreshFirmware(){
       const err=j?.state==='error'?'<div class="bad">'+esc(j.error||'')+'</div>':'';
       const changed=cam.firmware_changed_at_boot&&cam.previous_firmware?'<div class="ok">da '+esc(cam.previous_firmware)+'</div>':(cam.health_baseline_initialized===false?'<div class="muted">baseline nuova</div>':'');
       const slotTransition=j&&j.state==='completed'&&j.source_partition&&cam.ota_partition&&j.source_partition!==cam.ota_partition?'<div class="ok">'+esc(j.source_partition)+' → '+esc(cam.ota_partition)+'</div>':'';
-      const stateLabel=maintenance?'<span class="warn">RIAVVIO</span>':(!cam.online?'<span class="bad">OFFLINE</span>':(recovery?'<span class="bad">RECOVERY</span>':(startup?'<span class="warn">IN AVVIO</span>':'<span class="ok">ONLINE</span>')));
-      const grace=startup&&cam.startup_grace_remaining_ms?'<div class="muted">~'+Math.ceil(Number(cam.startup_grace_remaining_ms)/1000)+' s</div>':'';
-      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+stateLabel+grace+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
+      const stateLabel=maintenance?'<span class="warn">RIAVVIO</span>':(!cam.online?'<span class="bad">OFFLINE</span>':(nodeState==='standby'?'<span class="ok">STANDBY</span>':(recovery?'<span class="bad">'+esc(nodeState.toUpperCase())+'</span>':(startup?'<span class="warn">'+esc(nodeState.toUpperCase())+'</span>':'<span class="ok">'+esc(nodeState.toUpperCase())+'</span>'))));
+      const stateDetail=activeMode?'<div class="muted">'+esc(activeMode)+(cam.camera_driver_on?' · driver ON':' · driver OFF')+'</div>':'';
+      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+stateLabel+stateDetail+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
     }).join('');
   }catch(e){
     document.getElementById('firmwareManifest').textContent='Errore lettura stato OTA.';
