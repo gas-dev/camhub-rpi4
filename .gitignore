@@ -25,3 +25,5 @@ google_oauth.json
 
 # Runtime OTA firmware and job state
 firmware/
+
+error-state.json
