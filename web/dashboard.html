@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CamHub</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0b0e13;
+  --panel:#131820;
+  --panel2:#181f29;
+  --border:#2a3442;
+  --text:#edf2f7;
+  --muted:#9aa8b8;
+  --accent:#6eb6ff;
+  --ok:#77df91;
+  --bad:#ff8585;
+  --warn:#ffd27a;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif}
+button,input,select{font:inherit}
+button{border:1px solid var(--border);background:#202938;color:var(--text);padding:10px 13px;border-radius:9px;cursor:pointer}
+button:hover{border-color:#526579}
+button.primary{background:#244b72;border-color:#376b9d}
+button.danger{background:#552c32;border-color:#87424c}
+button:disabled{opacity:.42;cursor:not-allowed}
+input,select{width:100%;background:#0e131a;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 10px}
+label{display:block;color:var(--muted);font-size:13px;margin:10px 0 4px}
+a{color:var(--accent)}
+.shell{min-height:100vh;display:grid;grid-template-columns:220px 1fr}
+.sidebar{position:sticky;top:0;height:100vh;padding:20px 14px;border-right:1px solid var(--border);background:#10151c}
+.brand{font-size:22px;font-weight:700;margin:0 8px 4px}
+.subbrand{font-size:12px;color:var(--muted);margin:0 8px 22px}
+.nav button{display:block;width:100%;text-align:left;margin:4px 0;background:transparent;border-color:transparent}
+.nav button.active{background:#1d2733;border-color:#334154}
+.content{padding:22px;max-width:1500px;width:100%;margin:0 auto}
+.section{display:none}
+.section.active{display:block}
+.pagehead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:18px}
+.pagehead h1{font-size:24px;margin:0 0 4px}
+.muted{color:var(--muted)}
+.ok{color:var(--ok)}
+.bad{color:var(--bad)}
+.warn{color:var(--warn)}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px}
+.card{grid-column:span 6;background:var(--panel);border:1px solid var(--border);border-radius:13px;padding:16px}
+.card.full{grid-column:1/-1}
+.card.third{grid-column:span 4}
+.card h2{font-size:17px;margin:0 0 12px}
+.card h3{font-size:14px;margin:14px 0 8px;color:#cbd5e1}
+.mode-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.mode{padding:14px;text-align:left;min-height:92px}
+.mode b{display:block;margin-bottom:5px}
+.mode.active{outline:2px solid var(--accent);background:#18324a}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.statusline{line-height:1.65}
+.preview{width:100%;min-height:260px;max-height:560px;object-fit:contain;background:#050607;border-radius:10px;border:1px solid #242c36}
+.latest{width:100%;max-height:430px;object-fit:contain;background:#050607;border-radius:10px}
+.queue{font-size:13px;line-height:1.55;margin-top:12px;padding:10px;background:#0e131a;border-radius:9px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.three{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:9px 8px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+.scroll{overflow:auto}
+.mono{font-family:Consolas,monospace;word-break:break-all}
+.notice{padding:11px 12px;border:1px solid var(--border);border-radius:9px;background:#101722;margin:10px 0}
+.progress{height:8px;background:#0c1117;border-radius:99px;overflow:hidden;min-width:120px}
+.progress>div{height:100%;background:var(--accent);width:0}
+.section-tabs{display:none}
+@media(max-width:900px){
+  .shell{display:block}
+  .sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--border)}
+  .nav{display:flex;gap:5px;overflow:auto}
+  .nav button{width:auto;white-space:nowrap}
+  .content{padding:14px}
+  .card,.card.third{grid-column:1/-1}
+  .two,.three,.mode-row{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">CamHub</div>
+    <div class="subbrand">Raspberry Pi + CamNode</div>
+    <nav class="nav">
+      <button data-page="overview" class="active">Panoramica</button>
+      <button data-page="media">Media</button>
+      <button data-page="camera">Camera</button>
+      <button data-page="cloud">Cloud</button>
+      <button data-page="firmware">Firmware / OTA</button>
+      <button data-page="system">Sistema</button>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <section id="page-overview" class="section active">
+      <div class="pagehead"><div><h1>Panoramica</h1><div class="muted">Controllo operativo della telecamera</div></div><div id="topOnline"></div></div>
+
+      <div class="grid">
+        <div class="card full">
+          <h2>Modalità</h2>
+          <div class="mode-row">
+            <button id="modeAutomatic" class="mode" onclick="setMode('automatic')"><b>Automatico</b><span class="muted">Una foto all'intervallo impostato, nessuno stream continuo.</span></button>
+            <button id="modeStreaming" class="mode" onclick="setMode('streaming')"><b>Streaming</b><span class="muted">Un solo flusso condiviso per live, foto e video.</span></button>
+            <button id="modeAlarm" class="mode" onclick="setMode('alarm')"><b>Allarme</b><span class="muted">Motion detection locale; foto + video solo su evento.</span></button>
+          </div>
+          <div id="modeResult" class="notice muted">Caricamento stato...</div>
+        </div>
+
+        <div class="card">
+          <h2>Camera</h2>
+          <div id="nodeInfo" class="statusline muted">Caricamento...</div>
+          <div id="queueInfo" class="queue"></div>
+          <div class="actions">
+            <button id="photoButton" onclick="manualCapture()">Foto</button>
+            <button id="recordButton" onclick="recordVideo()">Video</button>
+          </div>
+          <div id="actionResult" class="muted" style="margin-top:9px"></div>
+        </div>
+
+        <div class="card">
+          <h2>Server e archivio</h2>
+          <div id="serverInfo" class="statusline muted">Caricamento...</div>
+          <div class="actions">
+            <button onclick="syncPending()">Sincronizza Drive</button>
+            <button onclick="cleanupOld()">Pulizia retention</button>
+          </div>
+        </div>
+
+        <div class="card full" id="liveCard" style="display:none">
+          <h2>Live streaming</h2>
+          <img id="live" class="preview" alt="Live non disponibile">
+          <div class="muted" style="margin-top:8px">Il browser visualizza lo stesso stream già ricevuto dal Raspberry: non apre una seconda connessione verso la ESP32.</div>
+        </div>
+
+        <div class="card full">
+          <h2>Ultima immagine archiviata</h2>
+          <img id="latest" class="latest" alt="Nessuna immagine">
+          <div id="latestInfo" class="muted" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-media" class="section">
+      <div class="pagehead"><div><h1>Media</h1><div class="muted">Foto, video, eventi allarme e integrità SHA-256</div></div></div>
+      <div class="card full scroll">
+        <table>
+          <thead><tr><th>Ora</th><th>Tipo</th><th>Evento</th><th>File</th><th>Dimensione</th><th>Cloud</th><th>SHA-256</th></tr></thead>
+          <tbody id="events"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="page-camera" class="section">
+      <div class="pagehead"><div><h1>Camera</h1><div class="muted">Acquisizione, qualità e modalità allarme</div></div></div>
+      <div class="grid">
+        <div class="card">
+          <h2>Immagine e video</h2>
+          <label>Risoluzione</label>
+          <select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select>
+          <label>Qualità JPEG (4 migliore, 30 più compressa)</label><input id="jpeg_quality" type="number" min="4" max="30">
+          <label>FPS streaming/video</label><input id="stream_max_fps" type="number" min="1" max="15">
+          <label>Durata video manuale, secondi</label><input id="event_video_sec" type="number" min="1" max="60">
+          <label>Intervallo automatico foto, secondi</label><input id="snapshot_interval_sec" type="number" min="1">
+        </div>
+
+        <div class="card">
+          <h2>Orientamento e immagine</h2>
+          <label>Luminosità (-2..2)</label><input id="brightness" type="number" min="-2" max="2">
+          <label>Contrasto (-2..2)</label><input id="contrast" type="number" min="-2" max="2">
+          <label>Saturazione (-2..2)</label><input id="saturation" type="number" min="-2" max="2">
+          <label><input id="horizontal_mirror" type="checkbox" style="width:auto"> Inverti destra/sinistra</label>
+          <label><input id="vertical_flip" type="checkbox" style="width:auto"> Capovolgi alto/basso</label>
+        </div>
+
+        <div class="card full">
+          <h2>Modalità Allarme</h2>
+          <div class="notice muted">Il movimento viene analizzato localmente sulla ESP32 in QVGA grayscale. In assenza di movimento non viene inviato uno stream video al Raspberry.</div>
+          <div class="three">
+            <div><label>Video allarme, secondi</label><input id="alarm_video_sec" type="number" min="1" max="60"></div>
+            <div><label>% pixel modificati</label><input id="motion_threshold_pct" type="number" min="1" max="80"></div>
+            <div><label>Differenza pixel</label><input id="motion_pixel_delta" type="number" min="5" max="100"></div>
+            <div><label>Campionamento, ms</label><input id="motion_sample_ms" type="number" min="150" max="5000"></div>
+            <div><label>Cooldown, secondi</label><input id="motion_cooldown_sec" type="number" min="3" max="300"></div>
+          </div>
+        </div>
+
+        <div class="card full">
+          <div class="actions"><button class="primary" onclick="saveConfig()">Salva configurazione camera</button></div>
+          <div id="saveResult" class="muted" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-cloud" class="section">
+      <div class="pagehead"><div><h1>Cloud</h1><div class="muted">Google Drive e sincronizzazione archivio</div></div></div>
+      <div class="grid">
+        <div class="card">
+          <h2>Google Drive</h2>
+          <label><input id="drive_enabled" type="checkbox" style="width:auto"> Sincronizzazione Drive attiva</label>
+          <label>Google OAuth Client ID</label><input id="google_oauth_client_id" type="text" placeholder="...apps.googleusercontent.com">
+          <label>Google OAuth Client Secret</label><input id="google_oauth_client_secret" type="password" autocomplete="new-password" placeholder="Lascia vuoto se già configurato">
+          <div class="actions"><button class="primary" onclick="connectGoogle()">Collega Google Drive</button><button onclick="disconnectGoogle()">Disconnetti</button><button onclick="testDrive()">Test Drive</button></div>
+          <div id="googleConnect" class="muted" style="margin-top:10px"></div>
+        </div>
+
+        <div class="card">
+          <h2>Sincronizzazione</h2>
+          <label>Attesa batch, secondi</label><input id="cloud_batch_delay_sec" type="number" min="0" max="60">
+          <label>Pausa su rate limit, secondi</label><input id="cloud_rate_limit_backoff_sec" type="number" min="60" max="86400">
+          <label>Limite richieste rclone/sec</label><input id="cloud_tps_limit" type="number" min="1" max="100">
+          <label>Retention locale, giorni</label><input id="retention_days" type="number" min="1">
+          <div class="actions"><button class="primary" onclick="saveConfig()">Salva impostazioni</button><button onclick="syncPending()">Sincronizza ora</button></div>
+          <div id="cloudResult" class="muted" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-firmware" class="section">
+      <div class="pagehead"><div><h1>Firmware / OTA</h1><div class="muted">Distribuzione firmware CamNode dal Raspberry</div></div></div>
+      <div class="grid">
+        <div class="card">
+          <h2>Firmware disponibile</h2>
+          <div id="firmwareManifest" class="statusline muted">Nessun firmware caricato.</div>
+          <label>Versione firmware</label><input id="firmwareVersion" type="text" placeholder="es. 0.8.1">
+          <label>PlatformIO firmware.bin</label><input id="firmwareFile" type="file" accept=".bin,application/octet-stream">
+          <div class="actions"><button class="primary" onclick="uploadFirmware()">Carica su CamHub</button></div>
+          <div id="firmwareUploadResult" class="muted" style="margin-top:9px"></div>
+        </div>
+
+        <div class="card">
+          <h2>Come funziona</h2>
+          <div class="statusline muted">
+            CamHub conserva il firmware, calcola SHA-256 e lo consegna alla camera solo quando richiedi l'aggiornamento.<br><br>
+            La camera scarica il file nella partizione OTA inattiva, verifica SHA-256, attiva il nuovo slot e riavvia. CamHub considera concluso l'aggiornamento solo quando riceve il nuovo heartbeat.
+          </div>
+          <div class="notice warn">Le camere precedenti al firmware 0.8.0 richiedono una sola installazione USB della nuova tabella dual-slot. Dopo quella migrazione gli aggiornamenti normali possono essere OTA.</div>
+        </div>
+
+        <div class="card full scroll">
+          <h2>Telecamere</h2>
+          <table>
+            <thead><tr><th>Camera</th><th>Stato</th><th>Installato</th><th>Partizione</th><th>OTA</th><th>Progresso</th><th>Azione</th></tr></thead>
+            <tbody id="firmwareCameras"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-system" class="section">
+      <div class="pagehead"><div><h1>Sistema</h1><div class="muted">Stato tecnico e manutenzione</div></div></div>
+      <div class="grid">
+        <div class="card"><h2>CamHub</h2><div id="systemInfo" class="statusline muted"></div></div>
+        <div class="card"><h2>Diagnostica</h2><div class="muted">Gli errori tecnici sono separati dalla dashboard operativa.</div><div class="actions"><button onclick="location.href='/debug'">Apri Debug / Errori</button></div></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+let cfg={};
+let recentMedia=[];
+let nodeCache=null;
+let googlePoll=null;
+let activePage='overview';
+
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
+function apiErrorText(r){return r.json().then(j=>j.detail||j.error||JSON.stringify(j)).catch(()=>r.text()).catch(()=>'Errore HTTP '+r.status)}
+
+document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>{
+  activePage=b.dataset.page;
+  document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x===b));
+  document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id==='page-'+activePage));
+  if(activePage==='firmware')refreshFirmware();
+}));
+
+function setModeButtons(mode){
+  document.getElementById('modeAutomatic').classList.toggle('active',mode==='automatic');
+  document.getElementById('modeStreaming').classList.toggle('active',mode==='streaming');
+  document.getElementById('modeAlarm').classList.toggle('active',mode==='alarm');
+}
+
+function renderQueue(q){
+  const active=q.active?('#'+q.active.id+' '+q.active.kind+' in esecuzione'):'nessuna operazione in esecuzione';
+  const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
+  const auto=q.mode==='automatic'?'<br>Prossima foto automatica tra '+(q.next_automatic_in_sec??0)+' s':'';
+  document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · in attesa '+(q.queue_length||0)+(queued?'<br>'+esc(queued):'')+auto;
+}
+
+function renderMode(st){
+  const mode=cfg.camera_mode||'automatic';
+  setModeButtons(mode);
+  const streaming=mode==='streaming';
+  document.getElementById('photoButton').disabled=!streaming;
+  document.getElementById('recordButton').disabled=!streaming;
+  document.getElementById('recordButton').textContent='Video '+(cfg.event_video_sec||10)+' s';
+
+  const liveCard=document.getElementById('liveCard');
+  const live=document.getElementById('live');
+  if(streaming){
+    liveCard.style.display='block';
+    const wanted='/api/camera/'+encodeURIComponent(cfg.camera_id)+'/live';
+    if(!live.src.includes(wanted))live.src=wanted+'?t='+Date.now();
+  }else{
+    liveCard.style.display='none';
+    if(live.src)live.removeAttribute('src');
+  }
+
+  let text='';
+  if(mode==='automatic')text='<span class="ok"><b>AUTOMATICO</b></span> · una foto ogni '+cfg.snapshot_interval_sec+' secondi';
+  if(mode==='streaming')text='<span class="ok"><b>STREAMING</b></span> · un solo flusso condiviso per live, foto e video';
+  if(mode==='alarm')text='<span class="ok"><b>ALLARME</b></span> · rilevamento locale · foto + video '+cfg.alarm_video_sec+' s su movimento';
+  document.getElementById('modeResult').innerHTML=text;
+  renderQueue(st.camera_queue||{});
+}
+
+async function refresh(){
+  try{
+    const [st,c,nodes,recent]=await Promise.all([
+      fetch('/api/status').then(r=>r.json()),
+      fetch('/api/config').then(r=>r.json()),
+      fetch('/api/nodes').then(r=>r.json()),
+      fetch('/api/recent?limit=100').then(r=>r.json())
+    ]);
+
+    cfg=c;
+    recentMedia=recent;
+    nodeCache=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0]||null;
+
+    const numberFields=['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','alarm_video_sec','motion_threshold_pct','motion_pixel_delta','motion_sample_ms','motion_cooldown_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'];
+    numberFields.forEach(k=>{const e=document.getElementById(k);if(e)e.value=cfg[k]??''});
+    document.getElementById('camera_frame_size').value=cfg.camera_frame_size||'SXGA';
+    ['horizontal_mirror','vertical_flip','drive_enabled'].forEach(k=>document.getElementById(k).checked=!!cfg[k]);
+    document.getElementById('google_oauth_client_id').value=cfg.google_oauth_client_id||'';
+
+    renderMode(st);
+
+    const n=nodeCache;
+    if(n){
+      document.getElementById('topOnline').innerHTML=n.online?'<span class="ok">● CAM01 ONLINE</span>':'<span class="bad">● CAM01 OFFLINE</span>';
+      document.getElementById('nodeInfo').innerHTML=
+        'Nodo: <b>'+esc(n.camera_id)+'</b><br>'+
+        'Firmware: '+esc(n.firmware||'')+' · IP '+esc(n.ip||'')+'<br>'+
+        'RSSI: '+esc(n.rssi??'')+' dBm · driver '+esc(n.driver_mode||'')+'<br>'+
+        'Motion: '+esc(n.motion_hits??0)+' / '+esc(n.motion_samples??0)+' · Allarmi: '+esc(n.alarm_triggers??0);
+    }else{
+      document.getElementById('topOnline').innerHTML='<span class="bad">● CAMERA NON PRESENTE</span>';
+      document.getElementById('nodeInfo').textContent='Nessun heartbeat CamNode.';
+    }
+
+    const bo=st.cloud_backoff||{};
+    document.getElementById('serverInfo').innerHTML=
+      'Server: <b>'+esc(st.server_name)+'</b><br>'+
+      'Media: '+st.media_count+' · '+st.data_mb+' MB<br>'+
+      'Drive: '+(st.drive_enabled?'<span class="ok">ATTIVO</span>':'DISATTIVO')+' · pendenti '+st.pending_cloud+
+      (bo.active?'<br><span class="warn">Pausa rate limit: '+bo.remaining_sec+' s</span>':'');
+    document.getElementById('systemInfo').innerHTML=document.getElementById('serverInfo').innerHTML+
+      '<br>Rclone: '+(st.rclone_available?'OK':'NON TROVATO')+
+      '<br>OAuth dedicato: '+(st.drive_custom_oauth?'SI':'NO');
+
+    if(st.latest_url){
+      document.getElementById('latest').src=st.latest_url+'?t='+Date.now();
+      document.getElementById('latestInfo').textContent=st.latest_name||'';
+    }
+
+    document.getElementById('events').innerHTML=recentMedia.map(x=>
+      '<tr><td>'+esc(x.captured_at||'')+'</td><td>'+esc(x.media_type||'')+'</td><td>'+esc(x.event_type||'')+'</td>'+
+      '<td><a href="/data/'+encodeURI(x.relative)+'" target="_blank">'+esc(x.file)+'</a></td>'+
+      '<td>'+fmtBytes(x.size)+'</td><td>'+esc(x.cloud_status||'')+'</td>'+
+      '<td class="mono">'+esc((x.sha256||'').slice(0,18))+(x.sha256?'…':'')+'</td></tr>'
+    ).join('');
+
+  }catch(e){
+    document.getElementById('topOnline').innerHTML='<span class="bad">Errore dashboard</span>';
+  }
+}
+
+async function refreshQueue(){
+  try{
+    const q=await fetch('/api/camera/queue').then(r=>r.json());
+    renderQueue(q);
+  }catch(e){}
+}
+
+async function setMode(mode){
+  const box=document.getElementById('modeResult');
+  box.textContent='Cambio modalità...';
+  const r=await fetch('/api/camera/mode/'+mode,{method:'POST'});
+  if(!r.ok){box.textContent='Errore: '+await apiErrorText(r);return}
+  box.textContent='Modalità applicata.';
+  await refresh();
+}
+
+async function manualCapture(){
+  const e=document.getElementById('actionResult');
+  const r=await fetch('/api/camera/'+encodeURIComponent(cfg.camera_id)+'/capture',{method:'POST'});
+  if(r.ok){const j=await r.json();e.textContent='Foto #'+j.operation.id+' aggiunta alla coda.'}
+  else e.textContent='Errore foto: '+await apiErrorText(r);
+  setTimeout(refreshQueue,150);
+}
+
+async function recordVideo(){
+  const e=document.getElementById('actionResult');
+  const d=cfg.event_video_sec||10;
+  const r=await fetch('/api/camera/'+encodeURIComponent(cfg.camera_id)+'/record?duration='+d,{method:'POST'});
+  if(r.ok){const j=await r.json();e.textContent='Video #'+j.operation.id+' ('+d+' s) aggiunto alla coda.'}
+  else e.textContent='Errore video: '+await apiErrorText(r);
+  setTimeout(refreshQueue,150);
+}
+
+async function saveConfig(){
+  const c={...cfg};
+  const nums=['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','alarm_video_sec','motion_threshold_pct','motion_pixel_delta','motion_sample_ms','motion_cooldown_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'];
+  nums.forEach(k=>c[k]=parseInt(document.getElementById(k).value));
+  c.camera_frame_size=document.getElementById('camera_frame_size').value;
+  ['horizontal_mirror','vertical_flip','drive_enabled'].forEach(k=>c[k]=document.getElementById(k).checked);
+  c.google_oauth_client_id=document.getElementById('google_oauth_client_id').value.trim();
+
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+  const msg=r.ok?(await r.json()):null;
+  const text=r.ok?(msg.camera_applied?'Salvato e applicato alla camera.':'Salvato; camera non raggiungibile in questo momento.'):'Errore: '+await apiErrorText(r);
+  document.getElementById('saveResult').textContent=text;
+  document.getElementById('cloudResult').textContent=text;
+  setTimeout(refresh,500);
+}
+
+async function syncPending(){
+  const r=await fetch('/api/cloud/sync-pending',{method:'POST'});
+  const j=await r.json();
+  const t=j.paused?'Drive in pausa: riprova tra '+j.remaining_sec+' s.':(r.ok?'Sincronizzazione avviata.':'Errore cloud.');
+  document.getElementById('actionResult').textContent=t;
+  document.getElementById('cloudResult').textContent=t;
+}
+
+async function cleanupOld(){
+  const r=await fetch('/api/maintenance/cleanup',{method:'POST'});
+  const j=await r.json();
+  document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';
+  setTimeout(refresh,500);
+}
+
+async function testDrive(){
+  const box=document.getElementById('cloudResult');
+  box.textContent='Test Drive...';
+  const r=await fetch('/api/cloud/test',{method:'POST'});
+  const j=await r.json();
+  box.textContent=(j.ok?'Google Drive OK. ':'Google Drive ERRORE. ')+(j.detail||'');
+}
+
+async function connectGoogle(){
+  const box=document.getElementById('googleConnect');
+  const clientId=document.getElementById('google_oauth_client_id').value.trim();
+  const clientSecret=document.getElementById('google_oauth_client_secret').value.trim();
+  if(!clientId){box.textContent='Inserisci il Google OAuth Client ID.';return}
+  box.textContent='Avvio collegamento...';
+  const r=await fetch('/api/cloud/oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:clientId,client_secret:clientSecret})});
+  const j=await r.json();
+  if(!r.ok){box.textContent='Errore OAuth: '+(j.detail||JSON.stringify(j));return}
+  box.innerHTML='<b>Codice:</b> <span class="mono">'+esc(j.user_code)+'</span><br><a href="'+j.verification_url+'" target="_blank" rel="noopener">Apri Google e autorizza</a><div id="googleOauthState" class="muted">In attesa...</div>';
+  window.open(j.verification_url,'_blank','noopener');
+  if(googlePoll)clearInterval(googlePoll);
+  googlePoll=setInterval(checkGoogleOauth,2000);
+}
+
+async function checkGoogleOauth(){
+  const j=await fetch('/api/cloud/oauth/status').then(r=>r.json());
+  const state=document.getElementById('googleOauthState');
+  if(state)state.textContent=j.status==='pending'?'In attesa di autorizzazione...':(j.message||j.status);
+  if(j.status==='connected'||j.status==='error'){
+    clearInterval(googlePoll);googlePoll=null;setTimeout(refresh,500);
+  }
+}
+
+async function disconnectGoogle(){
+  if(!confirm('Disconnettere Google Drive? I file locali restano invariati.'))return;
+  const j=await fetch('/api/cloud/oauth/disconnect',{method:'POST'}).then(r=>r.json());
+  document.getElementById('googleConnect').textContent=j.message||'Drive disconnesso.';
+  setTimeout(refresh,500);
+}
+
+async function uploadFirmware(){
+  const file=document.getElementById('firmwareFile').files[0];
+  const version=document.getElementById('firmwareVersion').value.trim();
+  const box=document.getElementById('firmwareUploadResult');
+  if(!version){box.textContent='Inserisci la versione firmware.';return}
+  if(!file){box.textContent='Seleziona firmware.bin.';return}
+  box.textContent='Caricamento e verifica...';
+  const fd=new FormData();fd.append('file',file);
+  const r=await fetch('/api/ota/upload?version='+encodeURIComponent(version),{method:'POST',body:fd});
+  if(r.ok){
+    const j=await r.json();
+    box.textContent='Firmware '+j.manifest.version+' pronto · SHA-256 '+j.manifest.sha256.slice(0,16)+'…';
+    await refreshFirmware();
+  }else box.textContent='Errore firmware: '+await apiErrorText(r);
+}
+
+function otaStateLabel(job){
+  if(!job)return 'Pronta';
+  const map={requested:'Richiesta',preparing:'Preparazione',downloading:'Download',verifying:'Verifica SHA-256',rebooting:'Riavvio',waiting_heartbeat:'Attesa heartbeat',completed:'Completato',error:'Errore'};
+  return map[job.state]||job.state||'—';
+}
+
+async function refreshFirmware(){
+  try{
+    const data=await fetch('/api/ota/status').then(r=>r.json());
+    const m=data.manifest;
+    document.getElementById('firmwareManifest').innerHTML=m?
+      'Versione: <b>'+esc(m.version)+'</b><br>Dimensione: '+fmtBytes(m.size)+'<br>SHA-256: <span class="mono">'+esc(m.sha256)+'</span><br>Caricato: '+esc(m.uploaded_at):
+      'Nessun firmware caricato.';
+
+    document.getElementById('firmwareCameras').innerHTML=(data.cameras||[]).map(cam=>{
+      const j=cam.job;
+      const p=Math.max(0,Math.min(100,Number(j?.progress_pct||0)));
+      const capable=cam.ota_capable;
+      const current=m&&cam.firmware===m.version;
+      let action='';
+      if(!capable)action='<span class="warn">USB iniziale richiesto</span>';
+      else if(current)action='<span class="ok">Aggiornata</span>';
+      else if(j&&['requested','preparing','downloading','verifying','rebooting','waiting_heartbeat'].includes(j.state))action='<button disabled>Aggiornamento...</button>';
+      else action='<button class="primary" onclick="updateCamera('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+')">Aggiorna</button>';
+      const err=j?.state==='error'?'<div class="bad">'+esc(j.error||'')+'</div>':'';
+      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+(cam.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+'</td><td>'+esc(cam.firmware||'—')+'</td><td>'+esc(cam.ota_partition||'—')+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
+    }).join('');
+  }catch(e){
+    document.getElementById('firmwareManifest').textContent='Errore lettura stato OTA.';
+  }
+}
+
+async function updateCamera(id){
+  if(!confirm('Aggiornare '+id+'? Durante l’operazione la camera sarà temporaneamente non disponibile.'))return;
+  const r=await fetch('/api/ota/camera/'+encodeURIComponent(id)+'/apply',{method:'POST'});
+  if(!r.ok){alert('Errore OTA: '+await apiErrorText(r));return}
+  await refreshFirmware();
+}
+
+refresh();
+refreshFirmware();
+setInterval(refresh,5000);
+setInterval(refreshQueue,1000);
+setInterval(refreshFirmware,3000);
+</script>
+</body>
+</html>
