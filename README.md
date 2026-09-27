@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.1.1
+## Current version: 1.1.2
 
 Architecture:
 
@@ -613,3 +613,42 @@ A timeout, remote close or temporary ESP32 stream interruption no longer termina
 Protocol diagnostics are emitted only when the stream has remained unavailable for at least 12 seconds. Repeated diagnostic messages are rate-limited to one per minute while the outage persists.
 
 This means a short ESP32 framebuffer recovery should normally remain invisible to the operator. A persistent outage remains visible through the normal grouped PROTOCOLLO warning/error mechanism.
+
+
+## CamHub 1.1.2 remote reboot and startup-aware connection recovery
+
+The Firmware / OTA camera list now supports an authenticated Riavvia action for CamNode 0.8.3 or later.
+
+Remote reboot is blocked when:
+
+    OTA is active
+    a camera operation is running
+    camera operations are queued
+    the camera is offline
+
+If Streaming is active, CamHub first closes the shared stream, places the camera in a temporary maintenance window, sends the reboot command, and waits for the new heartbeat.
+
+The camera list can display:
+
+    RIAVVIO
+    IN AVVIO
+    ONLINE
+    OFFLINE
+
+### Startup-aware streaming
+
+CamHub no longer treats an intentional restart, power-cycle recovery, stale heartbeat or CamNode startup-grace period as a protocol failure.
+
+The shared stream reader waits until:
+
+    heartbeat is fresh
+    service_ready = true
+    maintenance/reboot window has ended
+
+Only then does it connect to the MJPEG endpoint.
+
+For older firmware without service_ready, CamHub applies an uptime-based compatibility grace.
+
+Persistent ready-camera stream outages are still auto-reconnected and reported, but only after about 30 seconds of continuous outage. This avoids diagnostic noise when a camera is unplugged, moved and powered again.
+
+Automatic still capture also waits for camera readiness before calling /capture.
