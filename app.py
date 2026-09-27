@@ -2773,6 +2773,8 @@ def ota_apply(camera_id: str):
         progress_pct=0,
         target_version=target,
         source_version=installed,
+        source_partition=str(node.get("ota_partition") or ""),
+        source_boot_count=node.get("boot_count"),
         sha256=str(manifest["sha256"]),
         size=int(manifest["size"]),
         previous_mode=previous_mode,
