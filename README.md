@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.0.2
+## Current version: 1.0.3
 
 Architecture:
 
@@ -512,3 +512,30 @@ For provenance, the manifest stores both:
 and also records acquisition_mode plus marker position/color. The normal media SHA-256 is calculated after the marker has been applied, so the archived visible file and its integrity hash always correspond.
 
 Marker rendering is performed by CamHub rather than the ESP32 camera firmware. This avoids adding JPEG decode/re-encode memory pressure to the ESP32-CAM while producing the same permanent visual result in the archived file.
+
+
+## CamHub 1.0.3 camera health and OTA proof
+
+CamHub now derives a compact camera health state from CamNode heartbeat data:
+
+    OK
+    ATTENZIONE
+    ERRORE
+
+The health calculation considers online state, Wi-Fi RSSI, minimum free heap, abnormal reset reasons and camera-driver recovery failures.
+
+The dashboard Camera card now shows:
+
+    firmware
+    persistent boot number
+    uptime
+    reset reason
+    active OTA partition
+    firmware-changed-at-boot indication
+    Wi-Fi dBm and percentage
+    free heap and minimum free heap
+    free PSRAM
+
+The Firmware / OTA table also shows boot count and reset reason so a successful OTA can be verified without opening serial logs.
+
+For the first OTA validation, CamNode 0.8.1 is expected to show a firmware change, one additional persistent boot and an alternate ota_0/ota_1 partition after reboot.
