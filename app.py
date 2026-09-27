@@ -1225,6 +1225,19 @@ def enqueue_camera_operation(
 
 
 def _direct_camera_photo(camera_id: str, event_type: str) -> dict[str, Any]:
+    # Do not hit /capture while a freshly powered/rebooted camera is still
+    # stabilizing its sensor/DMA pipeline.
+    ready_deadline = time.monotonic() + 12.0
+    while time.monotonic() < ready_deadline:
+        node = get_node(camera_id)
+        if _node_ready_for_stream(camera_id, node):
+            break
+        time.sleep(0.25)
+    else:
+        raise RuntimeError(
+            "Camera did not become ready within startup grace"
+        )
+
     url = _node_url(camera_id, "capture_url", "/capture")
     last_error = ""
 
@@ -3218,6 +3231,10 @@ def ota_status():
                 "service_ready": node.get("service_ready"),
                 "startup_grace_remaining_ms": node.get("startup_grace_remaining_ms"),
                 "reboot_capable": bool(node.get("reboot_url")),
+                "maintenance_active": (
+                    time.monotonic()
+                    < float(camera_maintenance_until.get(camera_id) or 0.0)
+                ),
                 "job": job,
             })
         except Exception:
