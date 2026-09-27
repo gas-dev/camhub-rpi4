@@ -61,6 +61,7 @@ camera_operation_worker_started = False
 automatic_scheduler_started = False
 camera_operation_lock = threading.RLock()
 camera_operation_event = threading.Event()
+camera_operation_cancel_event = threading.Event()
 camera_operation_queue: deque[dict[str, Any]] = deque()
 camera_operation_active: dict[str, Any] | None = None
 camera_operation_history: list[dict[str, Any]] = []
@@ -1229,6 +1230,7 @@ def _set_recording_progress(
     with camera_operation_lock:
         if camera_operation_active is None:
             return
+        camera_operation_active["phase"] = "recording"
         camera_operation_active["progress_pct"] = min(
             99,
             int((elapsed * 100.0) / max(1, target_sec)),
@@ -1360,6 +1362,9 @@ def _spool_shared_stream(
                 raise RuntimeError(
                     "Streaming mode was stopped during recording"
                 )
+
+            if camera_operation_cancel_event.is_set():
+                break
 
             frame = get_stream_frame(camera_id, max_age=5.0)
             if frame is None:
@@ -1546,6 +1551,12 @@ def _finalize_recorded_video(
     source: str,
     requested_fps: int,
 ) -> dict[str, Any]:
+    with camera_operation_lock:
+        if camera_operation_active is not None:
+            camera_operation_active["phase"] = "encoding"
+            camera_operation_active["progress_pct"] = 99
+            camera_operation_active["remaining_sec"] = 0.0
+
     actual_fps, encoded_duration = _encode_mjpeg_spool(
         spool_path,
         out_path,
@@ -1577,6 +1588,7 @@ def _finalize_recorded_video(
         "captured_frames": frame_count,
         "captured_mjpeg_bytes": bytes_captured,
         "timing_model": "wall_clock_duration_measured_fps",
+        "stopped_early": capture_duration < max(0.0, seconds - 0.5),
     }
 
     meta = register_media(
@@ -1745,6 +1757,8 @@ def camera_operation_worker() -> None:
                 item = camera_operation_queue.popleft()
                 item["status"] = "running"
                 item["started_at"] = now_local().isoformat()
+                item["phase"] = "starting"
+                camera_operation_cancel_event.clear()
                 camera_operation_active = item
 
             try:
@@ -3449,6 +3463,41 @@ def record_video(camera_id: str, duration: int | None = None):
         "ok": True,
         "queued": True,
         "operation": item,
+    }
+
+
+@app.post("/api/camera/{camera_id}/record/stop")
+def stop_video(camera_id: str):
+    with camera_operation_lock:
+        active = (
+            dict(camera_operation_active)
+            if camera_operation_active is not None
+            else None
+        )
+
+    if (
+        not active
+        or active.get("kind") != "stream_video"
+        or str(active.get("camera_id") or "") != camera_id
+    ):
+        raise HTTPException(
+            409,
+            "No manual video recording is active for this camera",
+        )
+
+    camera_operation_cancel_event.set()
+
+    with camera_operation_lock:
+        if camera_operation_active is not None:
+            camera_operation_active["cancel_requested"] = True
+
+    return {
+        "ok": True,
+        "operation_id": active.get("id"),
+        "message": (
+            "Stop requested. CamHub will close capture and save "
+            "the portion already recorded."
+        ),
     }
 
 
