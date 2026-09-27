@@ -622,15 +622,24 @@ async function refreshFirmware(){
       const p=Math.max(0,Math.min(100,Number(j?.progress_pct||0)));
       const capable=cam.ota_capable;
       const current=m&&cam.firmware===m.version;
-      let action='';
-      if(!capable)action='<span class="warn">USB iniziale richiesto</span>';
-      else if(current)action='<span class="ok">Aggiornata</span>';
-      else if(j&&['requested','preparing','downloading','verifying','rebooting','waiting_heartbeat'].includes(j.state))action='<button disabled>Aggiornamento...</button>';
-      else action='<button class="primary" onclick="updateCamera('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+')">Aggiorna</button>';
+      const otaActive=!!(j&&['requested','preparing','downloading','verifying','rebooting','waiting_heartbeat'].includes(j.state));
+      const startup=cam.service_ready===false;
+      const actionParts=[];
+      if(!capable)actionParts.push('<span class="warn">USB iniziale richiesto</span>');
+      else if(current)actionParts.push('<span class="ok">Aggiornata</span>');
+      else if(otaActive)actionParts.push('<button disabled>Aggiornamento...</button>');
+      else if(startup)actionParts.push('<button disabled>Attendi avvio</button>');
+      else actionParts.push('<button class="primary" onclick="updateCamera('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+')">Aggiorna</button>');
+      if(cam.reboot_capable){
+        actionParts.push('<button '+((!cam.online||otaActive)?'disabled ':'')+'onclick="rebootCamera('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+')">Riavvia</button>');
+      }
+      const action='<div class="actions">'+actionParts.join('')+'</div>';
       const err=j?.state==='error'?'<div class="bad">'+esc(j.error||'')+'</div>':'';
       const changed=cam.firmware_changed_at_boot&&cam.previous_firmware?'<div class="ok">da '+esc(cam.previous_firmware)+'</div>':(cam.health_baseline_initialized===false?'<div class="muted">baseline nuova</div>':'');
       const slotTransition=j&&j.state==='completed'&&j.source_partition&&cam.ota_partition&&j.source_partition!==cam.ota_partition?'<div class="ok">'+esc(j.source_partition)+' → '+esc(cam.ota_partition)+'</div>':'';
-      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+(cam.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
+      const stateLabel=!cam.online?'<span class="bad">OFFLINE</span>':(startup?'<span class="warn">IN AVVIO</span>':'<span class="ok">ONLINE</span>');
+      const grace=startup&&cam.startup_grace_remaining_ms?'<div class="muted">~'+Math.ceil(Number(cam.startup_grace_remaining_ms)/1000)+' s</div>':'';
+      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+stateLabel+grace+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
     }).join('');
   }catch(e){
     document.getElementById('firmwareManifest').textContent='Errore lettura stato OTA.';
@@ -641,6 +650,15 @@ async function updateCamera(id){
   if(!confirm('Aggiornare '+id+'? Durante l’operazione la camera sarà temporaneamente non disponibile.'))return;
   const r=await fetch('/api/ota/camera/'+encodeURIComponent(id)+'/apply',{method:'POST'});
   if(!r.ok){alert('Errore OTA: '+await apiErrorText(r));return}
+  await refreshFirmware();
+}
+
+async function rebootCamera(id){
+  if(!confirm('Riavviare '+id+'? CamHub sospenderà lo streaming e aspetterà che la camera completi l’avvio.'))return;
+  const r=await fetch('/api/camera/'+encodeURIComponent(id)+'/reboot',{method:'POST'});
+  if(!r.ok){alert('Errore riavvio: '+await apiErrorText(r));return}
+  const j=await r.json();
+  document.getElementById('firmwareUploadResult').textContent=j.message||('Riavvio '+id+' richiesto.');
   await refreshFirmware();
 }
 
