@@ -2371,6 +2371,15 @@ def queue_cloud_sync(force: bool = False) -> None:
 @app.on_event("startup")
 def startup_event() -> None:
     cfg = load_config()
+
+    # Temporary MJPEG spool files are never evidence/media. If CamHub was
+    # interrupted during a recording, remove stale work files on restart.
+    for stale in BASE_DIR.glob("camhub_*.mjpg"):
+        try:
+            stale.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     load_ota_jobs()
     ensure_cloud_worker()
     ensure_camera_operation_worker()
