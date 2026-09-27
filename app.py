@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.1.5")
+app = FastAPI(title="CamHub", version="2.0.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -54,6 +54,8 @@ stream_threads: dict[str, threading.Thread] = {}
 stream_stop_events: dict[str, threading.Event] = {}
 alarm_last_event: dict[str, float] = {}
 camera_maintenance_until: dict[str, float] = {}
+automatic_capture_failures: dict[str, int] = {}
+automatic_capture_last_report: dict[str, float] = {}
 
 ota_job_lock = threading.RLock()
 ota_jobs: dict[str, dict[str, Any]] = {}
@@ -964,8 +966,65 @@ def _node_is_fresh(node: dict[str, Any], max_age_sec: float = 22.0) -> bool:
         return False
 
 
-def _node_ready_for_stream(camera_id: str, node: dict[str, Any] | None) -> bool:
+def _node_mode_ready(
+    node: dict[str, Any] | None,
+    mode: str,
+) -> bool:
     if not node or not _node_is_fresh(node):
+        return False
+
+    active_mode = str(
+        node.get("active_mode")
+        or node.get("mode")
+        or ""
+    ).lower()
+
+    state = str(node.get("state") or "").lower()
+
+    if active_mode != mode:
+        return False
+
+    if mode == "standby":
+        return (
+            state == "standby"
+            and not bool(node.get("camera_driver_on"))
+        )
+
+    return (
+        state == "ready"
+        and bool(
+            node.get(
+                "camera_ready",
+                node.get("camera_pipeline_healthy", False),
+            )
+        )
+    )
+
+
+def wait_for_node_mode(
+    camera_id: str,
+    mode: str,
+    timeout_sec: float = 25.0,
+) -> tuple[bool, dict[str, Any] | None]:
+    deadline = time.monotonic() + timeout_sec
+    latest: dict[str, Any] | None = None
+
+    while time.monotonic() < deadline:
+        latest = get_node(camera_id)
+
+        if _node_mode_ready(latest, mode):
+            return True, latest
+
+        time.sleep(0.25)
+
+    return False, latest
+
+
+def _node_ready_for_stream(
+    camera_id: str,
+    node: dict[str, Any] | None,
+) -> bool:
+    if not _node_mode_ready(node, "streaming"):
         return False
 
     maintenance_until = float(
@@ -974,19 +1033,19 @@ def _node_ready_for_stream(camera_id: str, node: dict[str, Any] | None) -> bool:
     if time.monotonic() < maintenance_until:
         return False
 
-    if node.get("service_ready") is False:
+    try:
+        seq = int((node or {}).get("latest_frame_seq") or 0)
+        age = int((node or {}).get("latest_frame_age_ms") or -1)
+    except Exception:
         return False
 
-    # Backward-compatible protection for pre-0.8.3 nodes that do not yet
-    # report service_ready explicitly.
-    uptime = float(node.get("uptime_sec") or 0.0)
-    if "service_ready" not in node and uptime > 0 and uptime < 8.0:
-        return False
-
-    return True
+    return seq > 0 and 0 <= age <= 6000
 
 
-def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
+def _stream_reader(
+    camera_id: str,
+    stop_event: threading.Event,
+) -> None:
     reconnect_failures = 0
     outage_started: float | None = None
     last_report_at = 0.0
@@ -999,43 +1058,50 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
             node = get_node(camera_id)
 
             if not _node_ready_for_stream(camera_id, node):
-                # Power-up, intentional reboot, stale heartbeat and the
-                # firmware startup-grace period are not protocol errors.
                 reconnect_failures = 0
                 outage_started = None
                 clear_stream_frame(camera_id)
-                stop_event.wait(0.5)
+                stop_event.wait(0.25)
                 continue
 
             stream_url = str((node or {}).get("stream_url") or "")
             if not stream_url:
-                reconnect_failures += 1
-                if outage_started is None:
-                    outage_started = time.monotonic()
-                stop_event.wait(min(3.0, 0.5 * reconnect_failures))
+                stop_event.wait(0.5)
                 continue
 
+            cfg = load_config()
             request = urllib.request.Request(
                 stream_url,
                 headers={
-                    "User-Agent": "CamHub/1.1.1-stream",
+                    "User-Agent": "CamHub/2.0-stream",
                     "Connection": "close",
+                    "X-Cam-Token": str(cfg["upload_token"]),
                 },
             )
 
             try:
-                with urllib.request.urlopen(request, timeout=20) as response:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=20,
+                ) as response:
                     buffer = b""
-                    received_frame_this_connection = False
+                    received_frame = False
 
                     while not stop_event.is_set():
                         if load_config().get("camera_mode") != "streaming":
                             break
 
+                        fresh_node = get_node(camera_id)
+                        if not _node_mode_ready(
+                            fresh_node,
+                            "streaming",
+                        ):
+                            break
+
                         chunk = response.read(8192)
                         if not chunk:
                             raise ConnectionError(
-                                "MJPEG stream closed by camera"
+                                "MJPEG connection closed"
                             )
 
                         buffer += chunk
@@ -1047,7 +1113,10 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
                                     buffer = buffer[-2:]
                                 break
 
-                            end = buffer.find(b"\xff\xd9", start + 2)
+                            end = buffer.find(
+                                b"\xff\xd9",
+                                start + 2,
+                            )
                             if end < 0:
                                 if start > 0:
                                     buffer = buffer[start:]
@@ -1062,9 +1131,7 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
                                 continue
 
                             set_stream_frame(camera_id, frame)
-                            received_frame_this_connection = True
-
-                            # A valid frame proves that the link recovered.
+                            received_frame = True
                             reconnect_failures = 0
                             outage_started = None
 
@@ -1076,51 +1143,64 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
                     break
 
                 fresh_node = get_node(camera_id)
-                if not _node_ready_for_stream(camera_id, fresh_node):
+
+                # Camera-side transition/recovery/error is a CAMERA state,
+                # not a protocol failure.
+                if not _node_mode_ready(
+                    fresh_node,
+                    "streaming",
+                ):
                     reconnect_failures = 0
                     outage_started = None
                     clear_stream_frame(camera_id)
-                    stop_event.wait(0.5)
+                    stop_event.wait(0.35)
                     continue
 
                 reconnect_failures += 1
                 now_mono = time.monotonic()
+
                 if outage_started is None:
                     outage_started = now_mono
 
                 outage_sec = now_mono - outage_started
 
-                # Connection loss is self-healed. Only surface it when it
-                # becomes a sustained outage of an otherwise ready camera.
+                # Network/protocol becomes operator-visible only if a camera
+                # that still reports READY has failed to deliver MJPEG for
+                # 45 continuous seconds.
                 if (
-                    outage_sec >= 30.0
-                    and now_mono - last_report_at >= 60.0
+                    outage_sec >= 45.0
+                    and now_mono - last_report_at >= 120.0
                 ):
                     record_runtime_error(
                         "streaming_mode",
                         (
-                            f"MJPEG unavailable for {outage_sec:.1f}s; "
-                            f"automatic reconnect attempt "
-                            f"{reconnect_failures}: {exc}"
+                            f"Ready camera MJPEG unavailable for "
+                            f"{outage_sec:.1f}s; reconnect "
+                            f"attempt {reconnect_failures}: {exc}"
                         ),
                         camera_id,
-                        "stream_reconnect",
+                        "stream_transport",
                     )
                     last_report_at = now_mono
 
                 clear_stream_frame(camera_id)
 
-                # Fast first retry, then bounded backoff. The camera firmware
-                # also self-recovers its framebuffer pipeline.
-                delay = min(5.0, 0.35 * reconnect_failures)
-                if received_frame_this_connection:
-                    delay = min(delay, 0.75)
+                delay = min(
+                    5.0,
+                    0.4 * reconnect_failures,
+                )
+
+                if received_frame:
+                    delay = min(delay, 0.8)
+
                 stop_event.wait(delay)
 
     finally:
         clear_stream_frame(camera_id)
+
         with stream_thread_lock:
             current = stream_threads.get(camera_id)
+
             if current is threading.current_thread():
                 stream_threads.pop(camera_id, None)
                 stream_stop_events.pop(camera_id, None)
@@ -1968,16 +2048,82 @@ def ensure_camera_operation_worker() -> None:
     ).start()
 
 
+def request_node_capture(
+    camera_id: str,
+    event_type: str = "periodic",
+) -> tuple[bool, str]:
+    node = get_node(camera_id)
+
+    if not _node_mode_ready(node, "automatic"):
+        return False, "camera not ready in automatic mode"
+
+    url = str(
+        (node or {}).get("capture_command_url")
+        or ""
+    )
+
+    if not url:
+        return False, "camera does not expose capture command endpoint"
+
+    cfg = load_config()
+
+    query = urllib.parse.urlencode({
+        "event_type": event_type,
+    })
+
+    req = urllib.request.Request(
+        url + "?" + query,
+        method="POST",
+        headers={
+            "User-Agent": "CamHub/2.0-capture",
+            "X-Cam-Token": str(cfg["upload_token"]),
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=6,
+        ) as response:
+            body = response.read(4096).decode(
+                "utf-8",
+                errors="replace",
+            )
+
+        return True, body
+
+    except Exception as exc:
+        return False, str(exc)
+
+
 def automatic_snapshot_scheduler() -> None:
     global automatic_next_due, automatic_last_interval
 
     last_mode = ""
+
     while True:
         try:
             cfg = load_config()
-            mode = str(cfg.get("camera_mode") or "automatic")
-            interval = max(1, int(cfg.get("snapshot_interval_sec", 60)))
-            camera_id = str(cfg.get("camera_id") or "CAM01")
+            mode = str(
+                cfg.get("camera_mode")
+                or "automatic"
+            )
+
+            interval = max(
+                1,
+                int(
+                    cfg.get(
+                        "snapshot_interval_sec",
+                        60,
+                    )
+                ),
+            )
+
+            camera_id = str(
+                cfg.get("camera_id")
+                or "CAM01"
+            )
+
             now_mono = time.monotonic()
 
             if mode != "automatic":
@@ -1992,32 +2138,76 @@ def automatic_snapshot_scheduler() -> None:
                 or automatic_next_due <= 0
                 or automatic_last_interval != interval
             ):
-                automatic_next_due = now_mono + interval
+                automatic_next_due = (
+                    now_mono + interval
+                )
                 automatic_last_interval = interval
                 last_mode = "automatic"
 
             if now_mono >= automatic_next_due:
-                if ota_camera_busy(camera_id):
-                    automatic_next_due = now_mono + interval
-                    time.sleep(0.25)
-                    continue
-
-                with camera_operation_lock:
-                    camera_idle = (
-                        camera_operation_active is None
-                        and not camera_operation_queue
-                    )
-
-                if camera_idle:
-                    enqueue_camera_operation(
-                        "photo",
+                if not ota_camera_busy(camera_id):
+                    ok, detail = request_node_capture(
                         camera_id,
-                        origin="automatic",
+                        "periodic",
                     )
 
-                automatic_next_due = now_mono + interval
+                    if ok:
+                        automatic_capture_failures[camera_id] = 0
+                    else:
+                        failures = (
+                            automatic_capture_failures.get(
+                                camera_id,
+                                0,
+                            )
+                            + 1
+                        )
+
+                        automatic_capture_failures[camera_id] = failures
+
+                        last_report = float(
+                            automatic_capture_last_report.get(
+                                camera_id,
+                                0.0,
+                            )
+                        )
+
+                        # Do not flood the error list while a node is simply
+                        # offline/transitioning. Report only sustained command
+                        # failure.
+                        if (
+                            failures >= 3
+                            and now_mono - last_report >= 120.0
+                        ):
+                            node = get_node(camera_id)
+
+                            if _node_mode_ready(
+                                node,
+                                "automatic",
+                            ):
+                                record_runtime_error(
+                                    "camera_command",
+                                    (
+                                        "Automatic capture command "
+                                        f"failed {failures} times: "
+                                        f"{detail}"
+                                    ),
+                                    camera_id,
+                                    "automatic_capture",
+                                )
+
+                                automatic_capture_last_report[
+                                    camera_id
+                                ] = now_mono
+
+                automatic_next_due = (
+                    now_mono + interval
+                )
+
         except Exception as exc:
-            record_runtime_error("automatic_snapshot_scheduler", str(exc))
+            record_runtime_error(
+                "automatic_snapshot_scheduler",
+                str(exc),
+            )
 
         time.sleep(0.25)
 
@@ -2718,71 +2908,176 @@ def get_config():
 @app.post("/api/config")
 def set_config(cfg: ConfigModel):
     data = cfg.model_dump()
-    target_camera_id = str(data.get("camera_id") or "CAM01")
+    target_camera_id = str(
+        data.get("camera_id")
+        or "CAM01"
+    )
+
     if ota_camera_busy(target_camera_id):
         raise HTTPException(
             409,
-            "Camera firmware update is in progress; wait before changing configuration",
+            (
+                "Camera firmware update is in progress; "
+                "wait before changing configuration"
+            ),
         )
+
     if not 1 <= data["snapshot_interval_sec"] <= 86400:
-        raise HTTPException(400, "snapshot_interval_sec must be 1..86400")
+        raise HTTPException(
+            400,
+            "snapshot_interval_sec must be 1..86400",
+        )
+
     if data["camera_mode"] == "manual":
         data["camera_mode"] = "streaming"
-    if data["camera_mode"] not in ("automatic", "streaming", "alarm"):
-        raise HTTPException(400, "camera_mode must be automatic, streaming or alarm")
+
+    if data["camera_mode"] not in (
+        "standby",
+        "automatic",
+        "streaming",
+        "alarm",
+    ):
+        raise HTTPException(
+            400,
+            (
+                "camera_mode must be standby, automatic, "
+                "streaming or alarm"
+            ),
+        )
+
     if not 1 <= data["event_video_sec"] <= 3600:
-        raise HTTPException(400, "event_video_sec must be 1..3600")
+        raise HTTPException(
+            400,
+            "event_video_sec must be 1..3600",
+        )
+
     if not 1 <= data["alarm_video_sec"] <= 600:
-        raise HTTPException(400, "alarm_video_sec must be 1..600")
+        raise HTTPException(
+            400,
+            "alarm_video_sec must be 1..600",
+        )
+
     if not 1 <= data["motion_threshold_pct"] <= 80:
-        raise HTTPException(400, "motion_threshold_pct must be 1..80")
+        raise HTTPException(
+            400,
+            "motion_threshold_pct must be 1..80",
+        )
+
     if not 5 <= data["motion_pixel_delta"] <= 100:
-        raise HTTPException(400, "motion_pixel_delta must be 5..100")
+        raise HTTPException(
+            400,
+            "motion_pixel_delta must be 5..100",
+        )
+
     if not 150 <= data["motion_sample_ms"] <= 5000:
-        raise HTTPException(400, "motion_sample_ms must be 150..5000")
+        raise HTTPException(
+            400,
+            "motion_sample_ms must be 150..5000",
+        )
+
     if not 3 <= data["motion_cooldown_sec"] <= 300:
-        raise HTTPException(400, "motion_cooldown_sec must be 3..300")
+        raise HTTPException(
+            400,
+            "motion_cooldown_sec must be 3..300",
+        )
+
     if data["camera_frame_size"] not in FRAME_SIZES:
-        raise HTTPException(400, "Unsupported camera_frame_size")
+        raise HTTPException(
+            400,
+            "Unsupported camera_frame_size",
+        )
+
     if not 4 <= data["jpeg_quality"] <= 30:
-        raise HTTPException(400, "jpeg_quality must be 4..30")
+        raise HTTPException(
+            400,
+            "jpeg_quality must be 4..30",
+        )
+
     if not 1 <= data["stream_max_fps"] <= 15:
-        raise HTTPException(400, "stream_max_fps must be 1..15")
+        raise HTTPException(
+            400,
+            "stream_max_fps must be 1..15",
+        )
+
     if not 0 <= data["cloud_batch_delay_sec"] <= 60:
-        raise HTTPException(400, "cloud_batch_delay_sec must be 0..60")
+        raise HTTPException(
+            400,
+            "cloud_batch_delay_sec must be 0..60",
+        )
+
     if not 60 <= data["cloud_rate_limit_backoff_sec"] <= 86400:
-        raise HTTPException(400, "cloud_rate_limit_backoff_sec must be 60..86400")
+        raise HTTPException(
+            400,
+            "cloud_rate_limit_backoff_sec must be 60..86400",
+        )
+
     if not 1 <= data["cloud_tps_limit"] <= 100:
-        raise HTTPException(400, "cloud_tps_limit must be 1..100")
-    for name in ("brightness", "contrast", "saturation"):
+        raise HTTPException(
+            400,
+            "cloud_tps_limit must be 1..100",
+        )
+
+    for name in (
+        "brightness",
+        "contrast",
+        "saturation",
+    ):
         if not -2 <= data[name] <= 2:
-            raise HTTPException(400, f"{name} must be -2..2")
+            raise HTTPException(
+                400,
+                f"{name} must be -2..2",
+            )
+
     old_cfg = load_config()
-    old_mode = str(old_cfg.get("camera_mode") or "automatic")
-    camera_id = str(data.get("camera_id") or "CAM01")
+    old_mode = str(
+        old_cfg.get("camera_mode")
+        or "automatic"
+    )
+
+    camera_id = str(
+        data.get("camera_id")
+        or "CAM01"
+    )
 
     if old_mode == "streaming":
-        stop_streaming_mode(camera_id)
+        stop_streaming_mode(
+            camera_id,
+            wait_sec=2.0,
+        )
 
     save_config(data)
+
     if data.get("drive_enabled"):
         queue_cloud_sync()
 
-    camera_applied = False
-    camera_message = "camera not yet online"
-    try:
-        camera_applied, camera_message = push_config_to_node(data["camera_id"], data)
-    except Exception as exc:
-        camera_message = str(exc)
+    accepted, message = push_config_to_node(
+        camera_id,
+        data,
+    )
 
-    if data.get("camera_mode") == "streaming" and camera_applied:
-        time.sleep(0.25)
+    applied = False
+    node: dict[str, Any] | None = None
+
+    if accepted:
+        applied, node = wait_for_node_mode(
+            camera_id,
+            str(data["camera_mode"]),
+            timeout_sec=30.0,
+        )
+
+    if (
+        data.get("camera_mode") == "streaming"
+        and applied
+    ):
         start_streaming_mode(camera_id)
 
     return {
         "ok": True,
-        "camera_applied": camera_applied,
-        "camera_message": camera_message,
+        "camera_accepted": accepted,
+        "camera_applied": applied,
+        "camera_message": message,
+        "node_state": (node or {}).get("state"),
+        "active_mode": (node or {}).get("active_mode"),
     }
 
 
@@ -3590,7 +3885,17 @@ def push_config_to_node(
     camera_id: str,
     cfg: dict[str, Any],
 ) -> tuple[bool, str]:
-    base = _node_url(camera_id, "control_url", "/control")
+    node = get_node(camera_id)
+
+    if not node or not _node_is_fresh(node, 45.0):
+        return False, "camera heartbeat unavailable"
+
+    base = _node_url(
+        camera_id,
+        "control_url",
+        "/control",
+    )
+
     query = (
         f"?mode={cfg['camera_mode']}"
         f"&mirror={1 if cfg['horizontal_mirror'] else 0}"
@@ -3609,46 +3914,40 @@ def push_config_to_node(
         f"&motion_cooldown={cfg['motion_cooldown_sec']}"
     )
 
-    last_error = ""
-    for attempt in range(1, 4):
-        try:
-            req = urllib.request.Request(
-                base + query,
-                headers={
-                    "User-Agent": "CamHub/1.1.4-control",
-                    "Connection": "close",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=20) as response:
-                body = response.read(4096).decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            return True, body
+    req = urllib.request.Request(
+        base + query,
+        headers={
+            "User-Agent": "CamHub/2.0-control",
+            "Connection": "close",
+            "X-Cam-Token": str(cfg["upload_token"]),
+        },
+    )
 
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=8,
+        ) as response:
+            body = response.read(4096).decode(
                 "utf-8",
                 errors="replace",
-            ).strip()
-            last_error = (
-                f"HTTP {exc.code}: {detail or exc.reason}"
             )
 
-            # 503 can be a short transition while the old MJPEG handler
-            # releases the camera mutex. Retry rather than rolling back
-            # immediately.
-            if exc.code != 503 or attempt >= 3:
-                break
+        return True, body
 
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt >= 3:
-                break
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
 
-        time.sleep(0.75 * attempt)
+        return False, (
+            f"HTTP {exc.code}: "
+            f"{detail or exc.reason}"
+        )
 
-    return False, last_error
+    except Exception as exc:
+        return False, str(exc)
 
 
 @app.post("/api/camera/mode/{mode}")
@@ -3656,17 +3955,29 @@ def set_camera_mode(mode: str):
     global automatic_next_due
 
     normalized = mode.strip().lower()
+
     if normalized == "manual":
         normalized = "streaming"
-    if normalized not in ("automatic", "streaming", "alarm"):
+
+    if normalized not in (
+        "standby",
+        "automatic",
+        "streaming",
+        "alarm",
+    ):
         raise HTTPException(
             400,
-            "Mode must be automatic, streaming or alarm",
+            (
+                "Mode must be standby, automatic, "
+                "streaming or alarm"
+            ),
         )
 
     cfg = load_config()
-    old_mode = str(cfg.get("camera_mode") or "automatic")
-    camera_id = str(cfg.get("camera_id") or "CAM01")
+    camera_id = str(
+        cfg.get("camera_id")
+        or "CAM01"
+    )
 
     if ota_camera_busy(camera_id):
         raise HTTPException(
@@ -3678,45 +3989,103 @@ def set_camera_mode(mode: str):
         if camera_operation_active is not None:
             raise HTTPException(
                 409,
-                "Wait for the current camera operation to finish before changing mode",
+                (
+                    "Wait for the current camera operation "
+                    "to finish before changing mode"
+                ),
             )
 
-    stop_streaming_mode(camera_id)
-
-    with camera_operation_lock:
         cancelled = len(camera_operation_queue)
         camera_operation_queue.clear()
+
+    # Stop Raspberry ingestion first. CamNode's stream endpoint itself is
+    # independent from the camera hardware and will also close after the
+    # state-machine transition.
+    if cfg.get("camera_mode") == "streaming":
+        stop_streaming_mode(
+            camera_id,
+            wait_sec=2.0,
+        )
 
     cfg["camera_mode"] = normalized
     save_config(cfg)
 
-    if normalized == "automatic":
-        automatic_next_due = (
-            time.monotonic()
-            + max(1, int(cfg.get("snapshot_interval_sec", 60)))
+    automatic_next_due = (
+        time.monotonic()
+        + max(
+            1,
+            int(
+                cfg.get(
+                    "snapshot_interval_sec",
+                    60,
+                )
+            ),
         )
-    else:
-        automatic_next_due = 0.0
+        if normalized == "automatic"
+        else 0.0
+    )
 
-    applied, message = push_config_to_node(camera_id, cfg)
-    if not applied:
-        cfg["camera_mode"] = old_mode
-        save_config(cfg)
-        if old_mode == "streaming":
-            start_streaming_mode(camera_id)
+    accepted, message = push_config_to_node(
+        camera_id,
+        cfg,
+    )
+
+    if not accepted:
         raise HTTPException(
             503,
-            f"Camera did not apply the requested mode; server mode was restored: {message}",
+            (
+                "Camera did not accept the mode command: "
+                + message
+            ),
+        )
+
+    applied, node = wait_for_node_mode(
+        camera_id,
+        normalized,
+        timeout_sec=30.0,
+    )
+
+    if not applied:
+        state = (
+            str((node or {}).get("state") or "unknown")
+        )
+
+        active = (
+            str(
+                (node or {}).get("active_mode")
+                or (node or {}).get("mode")
+                or "unknown"
+            )
+        )
+
+        last_error = str(
+            (node or {}).get("last_error_message")
+            or ""
+        )
+
+        raise HTTPException(
+            504,
+            (
+                f"Mode command was accepted but not confirmed "
+                f"within 30s. state={state}, active={active}"
+                + (
+                    f", camera={last_error}"
+                    if last_error
+                    else ""
+                )
+            ),
         )
 
     if normalized == "streaming":
-        time.sleep(0.3)
         start_streaming_mode(camera_id)
 
     result = camera_operation_status()
     result["cancelled_queued_from_previous_mode"] = cancelled
-    result["camera_applied"] = applied
+    result["camera_applied"] = True
     result["camera_message"] = message
+    result["node_state"] = (node or {}).get("state")
+    result["active_mode"] = (node or {}).get("active_mode")
+
     return result
 
 
