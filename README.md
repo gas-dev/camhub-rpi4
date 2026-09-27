@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.1.0
+## Current version: 1.1.1
 
 Architecture:
 
@@ -602,3 +602,14 @@ A Stop video control terminates manual capture early and saves the portion alrea
 Long recordings use one temporary .mjpg spool instead of thousands of individual temporary JPEG files. CamHub estimates the required working disk space during the first seconds and aborts early if there is insufficient space. Stale temporary spool files are removed automatically on CamHub restart.
 
 Alarm recordings use the same measured-FPS timing model and support up to 10 minutes when paired with CamNode 0.8.1 or later.
+
+
+## CamHub 1.1.1 self-healing streaming protocol
+
+The Raspberry streaming reader now owns reconnect behavior.
+
+A timeout, remote close or temporary ESP32 stream interruption no longer terminates the streaming worker and immediately produces a protocol error. CamHub clears the stale frame cache, reconnects automatically with bounded backoff and resumes the shared stream when frames return.
+
+Protocol diagnostics are emitted only when the stream has remained unavailable for at least 12 seconds. Repeated diagnostic messages are rate-limited to one per minute while the outage persists.
+
+This means a short ESP32 framebuffer recovery should normally remain invisible to the operator. A persistent outage remains visible through the normal grouped PROTOCOLLO warning/error mechanism.
