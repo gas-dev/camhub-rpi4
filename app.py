@@ -1425,11 +1425,11 @@ def queue_cloud_sync(force: bool = False) -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
-    load_config()
+    cfg = load_config()
     ensure_cloud_worker()
     ensure_camera_operation_worker()
     ensure_automatic_snapshot_scheduler()
-    if load_config().get("drive_enabled"):
+    if cfg.get("drive_enabled"):
         queue_cloud_sync()
 
 
@@ -1523,7 +1523,7 @@ async function refresh(){
  }
  renderQueue(st.camera_queue||{},streaming);
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
- if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')}
+ if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')+(n.driver_mode?' · driver '+n.driver_mode:'')+(n.motion_samples!==undefined?' · motion '+n.motion_hits+'/'+n.motion_samples:'')+(n.alarm_triggers!==undefined?' · allarmi '+n.alarm_triggers:'')}
  recentMedia=await fetch('/api/recent?limit=80').then(r=>r.json());
  document.getElementById('events').innerHTML=recentMedia.map((x,i)=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+(x.cloud_status==='ERROR'?'<button onclick="showMediaError('+i+')">ERROR - dettagli</button>':x.cloud_status)+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
 }
@@ -1673,8 +1673,6 @@ def set_config(cfg: ConfigModel):
         raise HTTPException(400, "motion_sample_ms must be 150..5000")
     if not 3 <= data["motion_cooldown_sec"] <= 300:
         raise HTTPException(400, "motion_cooldown_sec must be 3..300")
-    if not 1 <= data["event_video_sec"] <= 60:
-        raise HTTPException(400, "event_video_sec must be 1..60")
     if data["camera_frame_size"] not in FRAME_SIZES:
         raise HTTPException(400, "Unsupported camera_frame_size")
     if not 4 <= data["jpeg_quality"] <= 30:
@@ -1781,6 +1779,10 @@ async def node_heartbeat(request: Request, x_cam_token: str | None = Header(defa
     payload["last_seen"] = now_local().isoformat()
     payload["observed_ip"] = request.client.host if request.client else None
     save_node(camera_id, payload)
+
+    if cfg.get("camera_mode") == "streaming":
+        start_streaming_mode(camera_id)
+
     return {"ok": True}
 
 @app.post("/api/node/alarm")
@@ -1820,15 +1822,6 @@ async def node_alarm(
         duration=seconds,
         origin="alarm",
         priority=True,
-    )
-
-    record_runtime_error(
-        "alarm_trigger",
-        (
-            f"Motion alarm received. Video {seconds}s queued as "
-            f"operation #{item['id']}."
-        ),
-        camera_id,
     )
 
     return {
