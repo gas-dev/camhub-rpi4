@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.1.3
+## Current version: 1.1.4
 
 Architecture:
 
@@ -663,3 +663,10 @@ Manual streaming photos wait up to 20 seconds for the shared stream to self-heal
 Streaming photo/video availability errors are classified under the streaming subsystem rather than as an internal CamHub programming error.
 
 The Overview camera card exposes framebuffer recovery counters, sensor power cycles and background repair attempts.
+
+
+## CamHub 1.1.4 robust mode changes
+
+CamHub now allows up to 20 seconds for the node to complete a camera mode transition and retries transient HTTP 503 responses up to three times.
+
+This complements CamNode 0.8.5, which releases the long-lived Streaming camera mutex before applying a new mode or camera configuration.
