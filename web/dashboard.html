@@ -111,6 +111,12 @@ th{color:var(--muted);font-weight:600}
           <div id="modeResult" class="notice muted">Caricamento stato...</div>
         </div>
 
+        <div id="importantErrors" class="card full" style="display:none">
+          <h2>Attenzione</h2>
+          <div id="importantErrorsBody" class="statusline"></div>
+          <div class="actions"><button onclick="location.href='/debug'">Apri Errori / Debug</button></div>
+        </div>
+
         <div class="card">
           <h2>Camera</h2>
           <div id="nodeInfo" class="statusline muted">Caricamento...</div>
@@ -255,7 +261,7 @@ th{color:var(--muted);font-weight:600}
       <div class="pagehead"><div><h1>Sistema</h1><div class="muted">Stato tecnico e manutenzione</div></div></div>
       <div class="grid">
         <div class="card"><h2>CamHub</h2><div id="systemInfo" class="statusline muted"></div></div>
-        <div class="card"><h2>Diagnostica</h2><div class="muted">Gli errori tecnici sono separati dalla dashboard operativa.</div><div class="actions"><button onclick="location.href='/debug'">Apri Debug / Errori</button></div></div>
+        <div class="card"><h2>Diagnostica</h2><div id="systemErrors" class="statusline muted">Caricamento...</div><div class="actions"><button onclick="location.href='/debug'">Apri Errori / Debug</button></div></div>
       </div>
     </section>
   </main>
@@ -290,6 +296,36 @@ function renderQueue(q){
   const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
   const auto=q.mode==='automatic'?'<br>Prossima foto automatica tra '+(q.next_automatic_in_sec??0)+' s':'';
   document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · in attesa '+(q.queue_length||0)+(queued?'<br>'+esc(queued):'')+auto;
+}
+
+function renderErrors(summary){
+  summary=summary||{};
+  const sev=summary.by_severity||{};
+  const dom=summary.by_domain||{};
+  const important=Number(summary.important_count||0);
+  const card=document.getElementById('importantErrors');
+  const body=document.getElementById('importantErrorsBody');
+
+  if(important>0){
+    card.style.display='block';
+    const top=(summary.important||[]).slice(0,3).map(x=>
+      '<div style="margin-top:7px"><b>'+esc((x.domain||'').toUpperCase())+'</b> · '+esc(x.title||'')+
+      (Number(x.count||1)>1?' <span class="warn">×'+Number(x.count)+'</span>':'')+
+      '</div>'
+    ).join('');
+    body.innerHTML=
+      '<span class="bad"><b>'+important+' problema/i da verificare</b></span> · '+
+      'critici '+Number(sev.critical||0)+' · errori '+Number(sev.error||0)+
+      top;
+  }else{
+    card.style.display='none';
+    body.innerHTML='';
+  }
+
+  document.getElementById('systemErrors').innerHTML=
+    'Critici: <b>'+Number(sev.critical||0)+'</b> · Errori: <b>'+Number(sev.error||0)+'</b> · Avvisi: '+Number(sev.warning||0)+'<br>'+
+    'Camera: '+Number(dom.camera||0)+' · Protocollo: '+Number(dom.protocol||0)+' · CamHub: '+Number(dom.camhub||0)+' · Cloud: '+Number(dom.cloud||0)+
+    '<br><span class="muted">La Panoramica mostra solo problemi importanti. Gli avvisi e la cronologia sono nella pagina Errori / Debug.</span>';
 }
 
 function renderMode(st){
@@ -339,6 +375,7 @@ async function refresh(){
     document.getElementById('google_oauth_client_id').value=cfg.google_oauth_client_id||'';
 
     renderMode(st);
+    renderErrors(st.errors||{});
 
     const n=nodeCache;
     if(n){
@@ -368,7 +405,7 @@ async function refresh(){
       document.getElementById('latestInfo').textContent=st.latest_name||'';
     }
 
-    document.getElementById('events').innerHTML=recentMedia.map(x=>
+    document.getElementById('events').innerHTML=recentMedia.filter(x=>x.media_type!=='error').map(x=>
       '<tr><td>'+esc(x.captured_at||'')+'</td><td>'+esc(x.media_type||'')+'</td><td>'+esc(x.event_type||'')+'</td>'+
       '<td><a href="/data/'+encodeURI(x.relative)+'" target="_blank">'+esc(x.file)+'</a></td>'+
       '<td>'+fmtBytes(x.size)+'</td><td>'+esc(x.cloud_status||'')+'</td>'+
