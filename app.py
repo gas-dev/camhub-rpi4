@@ -1446,10 +1446,11 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <div class="grid">
 <div class="card"><h2>Controllo camera</h2>
 <div id="modeInfo"></div>
-<div class="actions"><button id="autoModeButton" onclick="setMode('automatic')">Automatico</button><button id="manualModeButton" onclick="setMode('manual')">Manuale</button></div>
-<div class="muted" style="margin-top:8px">Automatico: una foto all'intervallo configurato. Manuale: l'automatico si ferma e Foto/Video vengono eseguiti uno alla volta in coda.</div>
+<div class="actions"><button id="autoModeButton" onclick="setMode('automatic')">Automatico</button><button id="streamModeButton" onclick="setMode('streaming')">Streaming</button><button id="alarmModeButton" onclick="setMode('alarm')">Allarme</button></div>
+<div class="muted" style="margin-top:8px">Automatico: una foto all'intervallo configurato. Streaming: un solo flusso condiviso per live, foto e video. Allarme: rilevamento movimento locale sulla ESP32, senza stream continuo verso il Raspberry.</div>
 <div id="nodeInfo" class="muted" style="margin-top:10px"></div>
 <div id="queueInfo" class="muted" style="margin-top:10px"></div>
+<img id="live" class="live" alt="Live streaming" style="display:none;margin-top:10px">
 <div class="actions"><button id="photoButton" onclick="manualCapture()">Foto</button><button id="recordButton" onclick="recordVideo()">Registra video</button></div>
 <div id="actionResult"></div></div>
 <div class="card"><h2>Ultima foto archiviata</h2><img id="latest" class="latest"><div id="latestInfo" class="muted"></div></div>
@@ -1458,15 +1459,21 @@ body{font-family:Arial,sans-serif;background:#0f1115;color:#e8e8e8;margin:0}head
 <label>Intervallo automatico foto, secondi<input id="snapshot_interval_sec" type="number"></label>
 <label>Risoluzione<select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select></label>
 <label>Qualità JPEG, 4 migliore - 30 più compressa<input id="jpeg_quality" type="number" min="4" max="30"></label>
-<label>FPS video richiesti (1-15)<input id="stream_max_fps" type="number" min="1" max="15"></label>
-<div class="muted">Il flusso video viene aperto solo durante una registrazione. Non esiste più uno streaming continuo che compete con foto o video.</div>
+<label>FPS streaming/video (1-15)<input id="stream_max_fps" type="number" min="1" max="15"></label>
+<div class="muted">Lo stream continuo esiste solo in modalità Streaming. In Automatico e Allarme non viene inviato video continuo al Raspberry.</div>
 <label>Luminosità (-2..2)<input id="brightness" type="number" min="-2" max="2"></label>
 <label>Contrasto (-2..2)<input id="contrast" type="number" min="-2" max="2"></label>
 <label>Saturazione (-2..2)<input id="saturation" type="number" min="-2" max="2"></label>
 <label><input id="horizontal_mirror" type="checkbox"> Inverti destra/sinistra</label>
 <label><input id="vertical_flip" type="checkbox"> Capovolgi alto/basso</label>
 <div class="muted">Le modifiche di orientamento vengono applicate subito alla camera quando premi Salva.</div>
-<label>Durata registrazione, secondi<input id="event_video_sec" type="number" min="1" max="60"></label>
+<label>Durata video manuale, secondi<input id="event_video_sec" type="number" min="1" max="60"></label>
+<label>Durata video allarme, secondi<input id="alarm_video_sec" type="number" min="1" max="60"></label>
+<label>Sensibilità movimento: % pixel modificati<input id="motion_threshold_pct" type="number" min="1" max="80"></label>
+<label>Soglia differenza pixel (5-100)<input id="motion_pixel_delta" type="number" min="5" max="100"></label>
+<label>Campionamento movimento, ms<input id="motion_sample_ms" type="number" min="150" max="5000"></label>
+<label>Cooldown allarme, secondi<input id="motion_cooldown_sec" type="number" min="3" max="300"></label>
+<div class="muted">In Allarme la ESP32 analizza localmente immagini QVGA in scala di grigi. Al movimento passa alla qualità configurata, invia una foto e CamHub registra il video di allarme.</div>
 <label>Retention locale, giorni<input id="retention_days" type="number" min="1"></label>
 <label><input id="drive_enabled" type="checkbox"> Google Drive attivo</label>
 <label>Google OAuth Client ID<input id="google_oauth_client_id" type="text" placeholder="...apps.googleusercontent.com"></label>
@@ -1491,38 +1498,57 @@ async function refresh(){
  document.getElementById('status').innerHTML='Server: <b>'+st.server_name+'</b><br>Media: '+st.media_count+'<br>Spazio dati: '+st.data_mb+' MB<br>Rclone: '+(st.rclone_available?'<span class="ok">OK</span>':'<span class="bad">NON TROVATO</span>')+'<br>Drive: '+(st.drive_enabled?'ATTIVO':'DISATTIVO')+' · '+oauthText+'<br>Pendenti cloud: '+st.pending_cloud+boText;
  if(st.latest_url){document.getElementById('latest').src=st.latest_url+'?t='+Date.now();document.getElementById('latestInfo').textContent=st.latest_name||''}
  cfg=await fetch('/api/config').then(r=>r.json());
- for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit','google_oauth_client_id']) document.getElementById(k).value=cfg[k]??'';
+ for(const k of ['snapshot_interval_sec','camera_frame_size','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','alarm_video_sec','motion_threshold_pct','motion_pixel_delta','motion_sample_ms','motion_cooldown_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit','google_oauth_client_id']) document.getElementById(k).value=cfg[k]??'';
  for(const k of ['horizontal_mirror','vertical_flip','drive_enabled']) document.getElementById(k).checked=!!cfg[k];
  document.getElementById('recordButton').textContent='Video '+(cfg.event_video_sec||10)+' secondi';
- const manual=cfg.camera_mode==='manual';
- document.getElementById('photoButton').disabled=!manual;
- document.getElementById('recordButton').disabled=!manual;
- document.getElementById('modeInfo').innerHTML=manual?'<span class="ok"><b>MODALITÀ MANUALE</b></span> · automatico fermo':'<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · foto ogni '+cfg.snapshot_interval_sec+' secondi';
- renderQueue(st.camera_queue||{},manual);
+ const streaming=cfg.camera_mode==='streaming';
+ const alarm=cfg.camera_mode==='alarm';
+ document.getElementById('photoButton').disabled=!streaming;
+ document.getElementById('recordButton').disabled=!streaming;
+ if(streaming){
+   document.getElementById('modeInfo').innerHTML='<span class="ok"><b>MODALITÀ STREAMING</b></span> · live condiviso attivo';
+ }else if(alarm){
+   document.getElementById('modeInfo').innerHTML='<span class="ok"><b>MODALITÀ ALLARME</b></span> · motion detection locale · video '+(cfg.alarm_video_sec||10)+' s';
+ }else{
+   document.getElementById('modeInfo').innerHTML='<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · foto ogni '+cfg.snapshot_interval_sec+' secondi';
+ }
+ const live=document.getElementById('live');
+ if(streaming){
+   live.style.display='block';
+   const liveUrl='/api/camera/'+cfg.camera_id+'/live';
+   if(!live.src.includes(liveUrl))live.src=liveUrl+'?t='+Date.now();
+ }else{
+   live.style.display='none';
+   if(live.src)live.removeAttribute('src');
+ }
+ renderQueue(st.camera_queue||{},streaming);
  const nodes=await fetch('/api/nodes').then(r=>r.json());const n=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0];
  if(n){document.getElementById('nodeInfo').innerHTML='Nodo: <b>'+n.camera_id+'</b> · '+(n.online?'<span class="ok">ONLINE</span>':'<span class="bad">OFFLINE</span>')+' · IP '+(n.ip||'')+' · RSSI '+(n.rssi??'')+' dBm · FW '+(n.firmware||'')}
  recentMedia=await fetch('/api/recent?limit=80').then(r=>r.json());
  document.getElementById('events').innerHTML=recentMedia.map((x,i)=>'<tr><td>'+(x.captured_at||'')+'</td><td>'+x.media_type+'</td><td>'+(x.event_type||'')+'</td><td><a href="/data/'+x.relative+'" target="_blank">'+x.file+'</a></td><td>'+fmtBytes(x.size)+'</td><td>'+(x.cloud_status==='ERROR'?'<button onclick="showMediaError('+i+')">ERROR - dettagli</button>':x.cloud_status)+'</td><td class="mono">'+(x.sha256||'').slice(0,16)+'…</td></tr>').join('');
 }
-function renderQueue(q,manual){
+function renderQueue(q,streaming){
  const active=q.active?('#'+q.active.id+' '+q.active.kind+' in esecuzione'):'nessuna operazione in esecuzione';
  const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind).join(' → ');
- document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · attesa '+(q.queue_length||0)+(queued?'<br>'+queued:'')+(!manual&&q.next_automatic_in_sec!==undefined?'<br>Prossima foto automatica tra '+q.next_automatic_in_sec+' s':'');
+ const auto=q.mode==='automatic'&&q.next_automatic_in_sec!==undefined?'<br>Prossima foto automatica tra '+q.next_automatic_in_sec+' s':'';
+ document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · attesa '+(q.queue_length||0)+(queued?'<br>'+queued:'')+auto;
 }
 async function refreshQueue(){
  try{
   const q=await fetch('/api/camera/queue').then(r=>r.json());
-  const manual=q.mode==='manual';
-  document.getElementById('photoButton').disabled=!manual;
-  document.getElementById('recordButton').disabled=!manual;
-  document.getElementById('modeInfo').innerHTML=manual?'<span class="ok"><b>MODALITÀ MANUALE</b></span> · automatico fermo':'<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · acquisizione seriale';
-  renderQueue(q,manual);
+  const streaming=q.mode==='streaming';
+  document.getElementById('photoButton').disabled=!streaming;
+  document.getElementById('recordButton').disabled=!streaming;
+  if(q.mode==='alarm')document.getElementById('modeInfo').innerHTML='<span class="ok"><b>MODALITÀ ALLARME</b></span> · motion detection locale';
+  else if(streaming)document.getElementById('modeInfo').innerHTML='<span class="ok"><b>MODALITÀ STREAMING</b></span> · live condiviso attivo';
+  else document.getElementById('modeInfo').innerHTML='<span class="ok"><b>MODALITÀ AUTOMATICA</b></span> · acquisizione periodica';
+  renderQueue(q,streaming);
  }catch(e){}
 }
 function showMediaError(i){window.location.href='/debug'}
 async function apiErrorText(r){try{const j=await r.json();return j.detail||j.error||JSON.stringify(j)}catch(e){try{return await r.text()}catch(e2){return 'Errore HTTP '+r.status}}}
-async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.google_oauth_client_id=document.getElementById('google_oauth_client_id').value.trim();c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';setTimeout(refresh,800)}
-async function setMode(mode){const e=document.getElementById('actionResult');e.textContent=mode==='manual'?'Arresto automatico e passo in manuale...':'Attivo acquisizione automatica...';const r=await fetch('/api/camera/mode/'+mode,{method:'POST'});if(r.ok){e.textContent=mode==='manual'?'Modalità MANUALE attiva. Foto e video verranno messi in coda.':'Modalità AUTOMATICA attiva.'}else{e.textContent='Errore cambio modalità: '+await apiErrorText(r)}setTimeout(refresh,300)}
+async function saveConfig(){const c={...cfg};for(const k of ['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','alarm_video_sec','motion_threshold_pct','motion_pixel_delta','motion_sample_ms','motion_cooldown_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'])c[k]=parseInt(document.getElementById(k).value);c.google_oauth_client_id=document.getElementById('google_oauth_client_id').value.trim();c.camera_frame_size=document.getElementById('camera_frame_size').value;for(const k of ['horizontal_mirror','vertical_flip','drive_enabled'])c[k]=document.getElementById(k).checked;const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});const j=await r.json();document.getElementById('saveResult').textContent=r.ok?(j.camera_applied?'Salvato e applicato subito alla camera.':'Salvato. Camera non raggiungibile: verrà riallineata automaticamente.'):'Errore';setTimeout(refresh,800)}
+async function setMode(mode){const e=document.getElementById('actionResult');e.textContent='Cambio modalità in corso...';const r=await fetch('/api/camera/mode/'+mode,{method:'POST'});if(r.ok){e.textContent=mode==='streaming'?'Modalità STREAMING attiva. Live, Foto e Video usano un solo flusso condiviso.':(mode==='alarm'?'Modalità ALLARME armata. La ESP32 rileva localmente il movimento.':'Modalità AUTOMATICA attiva.')}else{e.textContent='Errore cambio modalità: '+await apiErrorText(r)}setTimeout(refresh,500)}
 async function manualCapture(){const e=document.getElementById('actionResult');const r=await fetch('/api/camera/'+cfg.camera_id+'/capture',{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Foto #'+j.operation.id+' aggiunta in coda, posizione '+j.operation.position+'.'}else{e.textContent='Errore foto: '+await apiErrorText(r)}setTimeout(refresh,250)}
 async function recordVideo(){const e=document.getElementById('actionResult');const d=cfg.event_video_sec||10;const r=await fetch('/api/camera/'+cfg.camera_id+'/record?duration='+d,{method:'POST'});if(r.ok){const j=await r.json();e.textContent='Video #'+j.operation.id+' ('+d+' s) aggiunto in coda, posizione '+j.operation.position+'.'}else{e.textContent='Errore video: '+await apiErrorText(r)}setTimeout(refresh,250)}
 async function syncPending(){const r=await fetch('/api/cloud/sync-pending',{method:'POST'});const j=await r.json();document.getElementById('actionResult').textContent=j.paused?'Google Drive è temporaneamente in pausa per rate limit. Riprova tra '+j.remaining_sec+' secondi.':(r.ok?'Sincronizzazione avviata.':'Errore cloud');setTimeout(refresh,1500)}
