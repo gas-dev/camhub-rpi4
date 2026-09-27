@@ -28,6 +28,7 @@ FIRMWARE_DIR = BASE_DIR / "firmware"
 OTA_MANIFEST_PATH = FIRMWARE_DIR / "camnode-manifest.json"
 OTA_FIRMWARE_PATH = FIRMWARE_DIR / "camnode-current.bin"
 OTA_JOBS_PATH = FIRMWARE_DIR / "ota-jobs.json"
+ERROR_STATE_PATH = BASE_DIR / "error-state.json"
 OTA_SLOT_SIZE = 0x1E0000
 
 DATA_DIR.mkdir(exist_ok=True)
@@ -336,16 +337,22 @@ def register_media(path: Path, camera: str, event_type: str, captured_at: dateti
     return data
 
 
-def record_runtime_error(source: str, detail: str, camera_id: str | None = None) -> None:
+def record_runtime_error(
+    source: str,
+    detail: str,
+    camera_id: str | None = None,
+    category: str | None = None,
+) -> None:
     item = {
         "time": now_local().isoformat(),
         "source": source,
         "camera_id": camera_id,
+        "category": category,
         "detail": str(detail)[-6000:],
     }
     with runtime_error_lock:
         runtime_errors.insert(0, item)
-        del runtime_errors[50:]
+        del runtime_errors[100:]
 
 
 def create_camera_error_file(camera_id: str, category: str, message: str, source: str = "camera") -> Path:
@@ -372,8 +379,350 @@ def create_camera_error_file(camera_id: str, category: str, message: str, source
         error_message=str(message)[-6000:],
         error_category=category,
     )
-    record_runtime_error(source, message, camera_id)
+    record_runtime_error(source, message, camera_id, category)
     return out_path
+
+
+def load_error_state() -> dict[str, Any]:
+    if not ERROR_STATE_PATH.exists():
+        return {"cleared_before": None}
+    try:
+        data = json.loads(ERROR_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"cleared_before": None}
+        return {"cleared_before": data.get("cleared_before")}
+    except Exception:
+        return {"cleared_before": None}
+
+
+def save_error_state(state: dict[str, Any]) -> None:
+    tmp = ERROR_STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(ERROR_STATE_PATH)
+
+
+def _parse_error_time(value: Any) -> datetime | None:
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _error_title(detail: Any) -> str:
+    text = str(detail or "").strip()
+    if not text:
+        return "Errore senza dettaglio"
+    for line in text.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        if clean.lower().startswith("message:"):
+            clean = clean.split(":", 1)[1].strip()
+        if clean:
+            return clean[:240]
+    return text[:240]
+
+
+def _error_domain(source: Any, category: Any, detail: Any) -> str:
+    src = str(source or "").lower()
+    cat = str(category or "").lower()
+    txt = str(detail or "").lower()
+
+    if (
+        "google_drive" in src
+        or "google_oauth" in src
+        or "cloud" in src
+        or "rclone" in src
+        or "googleapi" in txt
+        or "drive.googleapis.com" in txt
+    ):
+        return "cloud"
+
+    if src == "camera_firmware" or src.startswith("camera_firmware"):
+        return "camera"
+
+    protocol_sources = {
+        "streaming_mode",
+        "camera_proxy",
+        "node_protocol",
+        "camera_protocol",
+    }
+    transport_terms = (
+        "http error",
+        "http 4",
+        "http 5",
+        "connection refused",
+        "connection reset",
+        "connection error",
+        "timed out",
+        "timeout",
+        "urlopen",
+        "remote end closed",
+        "broken pipe",
+        "network is unreachable",
+    )
+    if src in protocol_sources or any(term in txt for term in transport_terms):
+        return "protocol"
+
+    if cat in {
+        "camera_init",
+        "capture",
+        "manual_capture",
+        "stream_capture",
+        "alarm_camera",
+        "alarm_capture",
+        "camera_mutex",
+    } and src.startswith("camera"):
+        return "camera"
+
+    return "camhub"
+
+
+def _error_base_severity(
+    domain: str,
+    source: Any,
+    category: Any,
+    detail: Any,
+) -> str:
+    src = str(source or "").lower()
+    cat = str(category or "").lower()
+    txt = str(detail or "").lower()
+
+    critical_terms = (
+        "nameerror",
+        "undefined name",
+        "not defined",
+        "syntaxerror",
+        "importerror",
+        "modulenotfounderror",
+        "traceback",
+        "segmentation fault",
+        "out of memory",
+    )
+    if domain == "camhub" and any(term in txt for term in critical_terms):
+        return "critical"
+
+    if domain == "camera":
+        if (
+            cat == "camera_init"
+            or "initialization failed" in txt
+            or "driver recovery failed" in txt
+            or "recovery_failures:" in txt and not "recovery_failures: 0" in txt
+        ):
+            return "critical"
+        if (
+            "failed even after camera-driver recovery" in txt
+            or "failed after driver recovery" in txt
+            or "framebuffer unavailable" in txt
+        ):
+            return "error"
+        return "warning"
+
+    if domain == "protocol":
+        if "401" in txt or "403" in txt or "invalid camera token" in txt:
+            return "error"
+        return "warning"
+
+    if domain == "cloud":
+        if (
+            "service_disabled" in txt
+            or "accessnotconfigured" in txt
+            or "invalid_grant" in txt
+            or "unauthorized" in txt
+        ):
+            return "error"
+        return "warning"
+
+    if "camera_operation" in src:
+        return "error"
+
+    return "error"
+
+
+def _error_fingerprint(item: dict[str, Any]) -> tuple[str, str, str]:
+    domain = _error_domain(
+        item.get("source"),
+        item.get("category"),
+        item.get("detail"),
+    )
+    category = str(item.get("category") or "").lower()
+    title = _error_title(item.get("detail")).lower()
+    return (domain, category, title)
+
+
+def _raw_error_items(include_cleared: bool = False) -> list[dict[str, Any]]:
+    state = load_error_state()
+    cutoff = _parse_error_time(state.get("cleared_before"))
+    rows: list[dict[str, Any]] = []
+
+    # Durable media/error metadata first.
+    for path in media_files():
+        meta = read_metadata(path)
+        detail = meta.get("cloud_error") or meta.get("error_message")
+        if not detail:
+            continue
+
+        item = {
+            "time": (
+                meta.get("cloud_error_at")
+                or meta.get("captured_at")
+                or meta.get("received_at")
+            ),
+            "source": (
+                "google_drive"
+                if meta.get("cloud_error")
+                else meta.get("source", "media")
+            ),
+            "category": meta.get("error_category"),
+            "camera_id": meta.get("camera_id"),
+            "detail": str(detail)[-6000:],
+            "file": path.name,
+        }
+        when = _parse_error_time(item["time"])
+        if not include_cleared and cutoff and when and when <= cutoff:
+            continue
+        rows.append(item)
+
+    # Runtime-only errors. Suppress duplicates of a durable error occurring
+    # within five seconds with the same source/title.
+    with runtime_error_lock:
+        runtime_copy = [dict(item) for item in runtime_errors]
+
+    for item in runtime_copy:
+        when = _parse_error_time(item.get("time"))
+        if not include_cleared and cutoff and when and when <= cutoff:
+            continue
+
+        title = _error_title(item.get("detail"))
+        duplicate = False
+        for existing in rows:
+            if str(existing.get("source") or "") != str(item.get("source") or ""):
+                continue
+            if _error_title(existing.get("detail")) != title:
+                continue
+            t2 = _parse_error_time(existing.get("time"))
+            if when and t2 and abs((when - t2).total_seconds()) <= 5:
+                duplicate = True
+                break
+        if not duplicate:
+            rows.append(item)
+
+    rows.sort(key=lambda item: str(item.get("time") or ""), reverse=True)
+    return rows
+
+
+def grouped_errors(
+    include_cleared: bool = False,
+    domain_filter: str | None = None,
+    severity_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for item in _raw_error_items(include_cleared=include_cleared):
+        domain = _error_domain(
+            item.get("source"),
+            item.get("category"),
+            item.get("detail"),
+        )
+        key = _error_fingerprint(item)
+        current = grouped.get(key)
+
+        if current is None:
+            current = {
+                "domain": domain,
+                "category": item.get("category"),
+                "source": item.get("source"),
+                "camera_id": item.get("camera_id"),
+                "title": _error_title(item.get("detail")),
+                "detail": item.get("detail"),
+                "file": item.get("file"),
+                "first_seen": item.get("time"),
+                "last_seen": item.get("time"),
+                "count": 1,
+            }
+            grouped[key] = current
+        else:
+            current["count"] += 1
+            current["first_seen"] = min(
+                str(current.get("first_seen") or ""),
+                str(item.get("time") or ""),
+            )
+            if str(item.get("time") or "") >= str(current.get("last_seen") or ""):
+                current["last_seen"] = item.get("time")
+                current["detail"] = item.get("detail")
+                current["file"] = item.get("file") or current.get("file")
+                current["camera_id"] = (
+                    item.get("camera_id") or current.get("camera_id")
+                )
+
+    results: list[dict[str, Any]] = []
+    for item in grouped.values():
+        severity = _error_base_severity(
+            item["domain"],
+            item.get("source"),
+            item.get("category"),
+            item.get("detail"),
+        )
+
+        # A transient protocol/cloud warning becomes important only if it repeats.
+        if severity == "warning" and int(item.get("count") or 0) >= 3:
+            severity = "error"
+
+        item["severity"] = severity
+
+        if domain_filter and item["domain"] != domain_filter:
+            continue
+        if severity_filter and item["severity"] != severity_filter:
+            continue
+        results.append(item)
+
+    order = {"critical": 0, "error": 1, "warning": 2, "info": 3}
+    results.sort(
+        key=lambda item: (
+            order.get(str(item.get("severity") or "info"), 9),
+            str(item.get("last_seen") or ""),
+        ),
+        reverse=False,
+    )
+
+    # Keep newest first inside the same severity.
+    results = sorted(
+        results,
+        key=lambda item: (
+            order.get(str(item.get("severity") or "info"), 9),
+            -(_parse_error_time(item.get("last_seen")) or datetime.min.astimezone()).timestamp(),
+        ),
+    )
+    return results
+
+
+def error_summary() -> dict[str, Any]:
+    items = grouped_errors()
+    by_domain = {"camera": 0, "protocol": 0, "camhub": 0, "cloud": 0}
+    by_severity = {"critical": 0, "error": 0, "warning": 0}
+
+    for item in items:
+        domain = str(item.get("domain") or "camhub")
+        severity = str(item.get("severity") or "warning")
+        by_domain[domain] = by_domain.get(domain, 0) + 1
+        by_severity[severity] = by_severity.get(severity, 0) + 1
+
+    important = [
+        item for item in items
+        if item.get("severity") in ("critical", "error")
+    ][:5]
+
+    return {
+        "by_domain": by_domain,
+        "by_severity": by_severity,
+        "important_count": (
+            by_severity.get("critical", 0) + by_severity.get("error", 0)
+        ),
+        "important": important,
+        "cleared_before": load_error_state().get("cleared_before"),
+    }
 
 
 def node_path(camera_id: str) -> Path:
@@ -2423,44 +2772,48 @@ def api_recent(limit: int = 50):
 
 
 @app.get("/api/errors")
-def api_errors(limit: int = 20):
-    max_items = max(1, min(limit, 100))
-    errors: list[dict[str, Any]] = []
+def api_errors(
+    limit: int = 50,
+    domain: str | None = None,
+    severity: str | None = None,
+    include_cleared: bool = False,
+):
+    max_items = max(1, min(limit, 200))
+    domain_filter = domain if domain in {
+        "camera", "protocol", "camhub", "cloud"
+    } else None
+    severity_filter = severity if severity in {
+        "critical", "error", "warning"
+    } else None
+
+    return grouped_errors(
+        include_cleared=include_cleared,
+        domain_filter=domain_filter,
+        severity_filter=severity_filter,
+    )[:max_items]
+
+
+@app.get("/api/errors/summary")
+def api_error_summary():
+    return error_summary()
+
+
+@app.post("/api/errors/clear")
+def clear_visible_errors():
+    cleared_at = now_local().isoformat()
+    save_error_state({"cleared_before": cleared_at})
 
     with runtime_error_lock:
-        errors.extend(dict(item) for item in runtime_errors[:max_items])
+        runtime_errors.clear()
 
-    for path in media_files():
-        meta = read_metadata(path)
-        detail = meta.get("cloud_error") or meta.get("error_message")
-        if not detail:
-            continue
-        errors.append({
-            "time": meta.get("cloud_error_at") or meta.get("captured_at") or meta.get("received_at"),
-            "source": "google_drive" if meta.get("cloud_error") else meta.get("source", "media"),
-            "camera_id": meta.get("camera_id"),
-            "detail": str(detail)[-6000:],
-            "file": path.name,
-        })
-
-    errors.sort(key=lambda item: str(item.get("time") or ""), reverse=True)
-
-    unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in errors:
-        key = (
-            str(item.get("time") or ""),
-            str(item.get("source") or ""),
-            str(item.get("detail") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-        if len(unique) >= max_items:
-            break
-
-    return unique
+    return {
+        "ok": True,
+        "cleared_before": cleared_at,
+        "message": (
+            "Error view cleared. Media, manifests and historical error files "
+            "were not deleted."
+        ),
+    }
 
 
 @app.get("/api/status")
@@ -2485,6 +2838,7 @@ def api_status():
         "streaming": streaming_mode_status(str(cfg.get("camera_id") or "CAM01")),
         "latest_name": latest.name if latest else None,
         "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
+        "errors": error_summary(),
     }
 
 
