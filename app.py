@@ -699,7 +699,7 @@ def _streaming_video(camera_id: str, seconds: int) -> dict[str, Any]:
     cfg = load_config()
     fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
     dt = now_local()
-    event_name = event_type or f"video_{seconds}s"
+    event_name = f"video_{seconds}s"
     out_path = camera_day_dir(camera_id, dt) / make_filename(
         camera_id,
         event_name,
@@ -814,9 +814,10 @@ def _exclusive_camera_video(
     requested_fps = max(1, min(int(cfg.get("stream_max_fps", 5)), 15))
     stream_url = _node_url(camera_id, "stream_url", "/stream")
     dt = now_local()
+    event_name = event_type or f"video_{seconds}s"
     out_path = camera_day_dir(camera_id, dt) / make_filename(
         camera_id,
-        f"video_{seconds}s",
+        event_name,
         dt,
         ".mp4",
     )
