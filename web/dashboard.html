@@ -132,6 +132,7 @@ th{color:var(--muted);font-weight:600}
               <option value="600">10 minuti</option>
             </select>
             <button id="recordButton" onclick="recordVideo()">Registra video</button>
+            <button id="stopRecordButton" class="danger" onclick="stopVideo()" disabled>Stop video</button>
           </div>
           <div id="actionResult" class="muted" style="margin-top:9px"></div>
         </div>
@@ -290,6 +291,7 @@ let recentMedia=[];
 let nodeCache=null;
 let googlePoll=null;
 let activePage='overview';
+let quickVideoInitialized=false;
 
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
@@ -311,6 +313,7 @@ function setModeButtons(mode){
 
 function renderQueue(q){
   let active='nessuna operazione in esecuzione';
+  let manualVideoActive=false;
   if(q.active){
     active='#'+q.active.id+' '+q.active.kind+' in esecuzione';
     if(q.active.kind==='stream_video'||q.active.kind==='alarm_video'){
@@ -318,9 +321,13 @@ function renderQueue(q){
       const elapsed=Number(q.active.elapsed_sec||0);
       const remaining=Number(q.active.remaining_sec||0);
       const fps=Number(q.active.capture_fps||0);
-      active+=' · '+pct+'% · '+fmtDuration(elapsed)+' trascorsi · '+fmtDuration(remaining)+' restanti · '+fps.toFixed(2)+' fps reali';
+      const phase=q.active.phase==='encoding'?'codifica':'registrazione';
+      active+=' · '+phase+' · '+pct+'% · '+fmtDuration(elapsed)+' trascorsi · '+fmtDuration(remaining)+' restanti · '+fps.toFixed(2)+' fps reali';
     }
+    manualVideoActive=q.active.kind==='stream_video';
   }
+  const stop=document.getElementById('stopRecordButton');
+  if(stop)stop.disabled=!manualVideoActive;
   const queued=(q.queued||[]).map(x=>'#'+x.id+' '+x.kind+(x.duration?' '+fmtDuration(x.duration):'')).join(' → ');
   const auto=q.mode==='automatic'?'<br>Prossima foto automatica tra '+(q.next_automatic_in_sec??0)+' s':'';
   document.getElementById('queueInfo').innerHTML='<b>Coda:</b> '+active+' · in attesa '+(q.queue_length||0)+(queued?'<br>'+esc(queued):'')+auto;
@@ -366,7 +373,10 @@ function renderMode(st){
   if(quick&&!Array.from(quick.options).some(o=>Number(o.value)===Number(cfg.event_video_sec||10))){
     const opt=document.createElement('option');opt.value=String(cfg.event_video_sec||10);opt.textContent=fmtDuration(cfg.event_video_sec||10);quick.appendChild(opt);
   }
-  if(quick)quick.value=String(cfg.event_video_sec||10);
+  if(quick&&!quickVideoInitialized){
+    quick.value=String(cfg.event_video_sec||10);
+    quickVideoInitialized=true;
+  }
   document.getElementById('recordButton').textContent='Registra video';
 
   const liveCard=document.getElementById('liveCard');
@@ -492,6 +502,18 @@ async function recordVideo(){
   const r=await fetch('/api/camera/'+encodeURIComponent(cfg.camera_id)+'/record?duration='+d,{method:'POST'});
   if(r.ok){const j=await r.json();e.textContent='Video #'+j.operation.id+' ('+fmtDuration(d)+') aggiunto alla coda. La durata è indipendente dagli FPS.'}
   else e.textContent='Errore video: '+await apiErrorText(r);
+  setTimeout(refreshQueue,150);
+}
+
+async function stopVideo(){
+  const e=document.getElementById('actionResult');
+  const r=await fetch('/api/camera/'+encodeURIComponent(cfg.camera_id)+'/record/stop',{method:'POST'});
+  if(r.ok){
+    const j=await r.json();
+    e.textContent=j.message||'Arresto video richiesto.';
+  }else{
+    e.textContent='Errore stop video: '+await apiErrorText(r);
+  }
   setTimeout(refreshQueue,150);
 }
 
