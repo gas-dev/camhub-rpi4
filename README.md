@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.0.0
+## Current version: 1.0.1
 
 Architecture:
 
@@ -462,3 +462,29 @@ OTA jobs are persisted so the dashboard can recover their state after a CamHub r
 ### CI
 
 CamHub GitHub Actions validates Python syntax and config.example.json on each push.
+
+
+## CamHub 1.0.1 error management
+
+The diagnostic system now separates operational problems into four domains:
+
+    CAMERA
+    PROTOCOL
+    CAMHUB
+    CLOUD
+
+Repeated identical problems are grouped by subsystem, category and message title. A repeated transient protocol/cloud warning is promoted to ERROR after three occurrences so recurring faults become visible without flooding the interface.
+
+Severity levels:
+
+    CRITICAL
+    ERROR
+    WARNING
+
+The main Panoramica shows only CRITICAL and ERROR groups. Warnings and full technical details remain in Errori / Debug.
+
+The Debug page includes subsystem and severity filters, repeat counts, first/last occurrence and expandable technical detail.
+
+The Media page hides diagnostic .txt entries so normal evidence/media browsing is not cluttered by technical logs.
+
+“Pulisci vista” stores a local cutoff timestamp in error-state.json and clears the in-memory runtime feed. It does not delete media, manifests or historical diagnostic files. Older entries can still be inspected by enabling “mostra anche puliti”.
