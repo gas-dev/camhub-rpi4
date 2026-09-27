@@ -1650,11 +1650,13 @@ def _spool_direct_mjpeg_stream(
     spool_path: Path,
 ) -> tuple[int, int, float]:
     stream_url = _node_url(camera_id, "stream_url", "/stream")
+    cfg = load_config()
     request = urllib.request.Request(
         stream_url,
         headers={
-            "User-Agent": "CamHub/1.1-video",
+            "User-Agent": "CamHub/2.0-alarm-video",
             "Connection": "close",
+            "X-Cam-Token": str(cfg["upload_token"]),
         },
     )
 
@@ -3733,9 +3735,15 @@ def ota_status():
                 "ota_capable": bool(node.get("ota_capable")),
                 "ota_partition": node.get("ota_partition"),
                 "service_ready": node.get("service_ready"),
-                "startup_grace_remaining_ms": node.get("startup_grace_remaining_ms"),
+                "state": node.get("state"),
+                "desired_mode": node.get("desired_mode"),
+                "active_mode": node.get("active_mode") or node.get("mode"),
+                "camera_ready": node.get("camera_ready"),
+                "camera_driver_on": node.get("camera_driver_on"),
                 "camera_pipeline_healthy": node.get("camera_pipeline_healthy"),
-                "repair_mutex_timeouts": node.get("repair_mutex_timeouts"),
+                "latest_frame_age_ms": node.get("latest_frame_age_ms"),
+                "last_error_code": node.get("last_error_code"),
+                "last_error_message": node.get("last_error_message"),
                 "reboot_capable": bool(node.get("reboot_url")),
                 "maintenance_active": (
                     time.monotonic()
