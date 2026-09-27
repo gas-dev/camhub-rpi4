@@ -1082,7 +1082,7 @@ def _stream_reader(
             try:
                 with urllib.request.urlopen(
                     request,
-                    timeout=20,
+                    timeout=8,
                 ) as response:
                     buffer = b""
                     received_frame = False
@@ -1207,18 +1207,48 @@ def _stream_reader(
 
 
 def start_streaming_mode(camera_id: str) -> None:
+    existing: threading.Thread | None = None
+    existing_stop: threading.Event | None = None
+
     with stream_thread_lock:
         existing = stream_threads.get(camera_id)
-        if existing and existing.is_alive():
+        existing_stop = stream_stop_events.get(camera_id)
+
+        if (
+            existing
+            and existing.is_alive()
+            and not (
+                existing_stop
+                and existing_stop.is_set()
+            )
+        ):
+            return
+
+    # A previous reader may still be unwinding from a socket read. Give it
+    # a short chance to exit before deciding whether a new reader is safe.
+    if (
+        existing
+        and existing.is_alive()
+        and existing_stop
+        and existing_stop.is_set()
+    ):
+        existing.join(timeout=1.5)
+
+    with stream_thread_lock:
+        current = stream_threads.get(camera_id)
+
+        if current and current.is_alive():
             return
 
         stop_event = threading.Event()
+
         worker = threading.Thread(
             target=_stream_reader,
             args=(camera_id, stop_event),
             daemon=True,
             name=f"camhub-streaming-{camera_id}",
         )
+
         stream_stop_events[camera_id] = stop_event
         stream_threads[camera_id] = worker
         worker.start()
