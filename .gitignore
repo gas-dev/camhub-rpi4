@@ -22,3 +22,6 @@ token*.json
 .DS_Store
 
 google_oauth.json
+
+# Runtime OTA firmware and job state
+firmware/
