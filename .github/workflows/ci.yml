@@ -17,3 +17,15 @@ jobs:
         run: python -m py_compile app.py
       - name: Validate config JSON
         run: python -m json.tool config.example.json > /dev/null
+      - name: Validate dashboard JavaScript
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          html = Path("web/dashboard.html").read_text(encoding="utf-8")
+          scripts = re.findall(r"<script>(.*?)</script>", html, flags=re.S)
+          if not scripts:
+              raise SystemExit("No dashboard script found")
+          Path("/tmp/dashboard.js").write_text("\n".join(scripts), encoding="utf-8")
+          PY
+          node --check /tmp/dashboard.js
