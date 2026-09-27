@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 1.1.2
+## Current version: 1.1.3
 
 Architecture:
 
@@ -652,3 +652,14 @@ For older firmware without service_ready, CamHub applies an uptime-based compati
 Persistent ready-camera stream outages are still auto-reconnected and reported, but only after about 30 seconds of continuous outage. This avoids diagnostic noise when a camera is unplugged, moved and powered again.
 
 Automatic still capture also waits for camera readiness before calling /capture.
+
+
+## CamHub 1.1.3 camera-pipeline recovery awareness
+
+CamHub now treats camera_pipeline_healthy=false as a camera recovery state rather than a healthy streaming node.
+
+Manual streaming photos wait up to 20 seconds for the shared stream to self-heal instead of failing after five seconds.
+
+Streaming photo/video availability errors are classified under the streaming subsystem rather than as an internal CamHub programming error.
+
+The Overview camera card exposes framebuffer recovery counters, sensor power cycles and background repair attempts.
