@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.1.2")
+app = FastAPI(title="CamHub", version="1.1.3")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -1306,15 +1306,24 @@ def _direct_camera_photo(camera_id: str, event_type: str) -> dict[str, Any]:
 
 
 def _streaming_photo(camera_id: str) -> dict[str, Any]:
-    deadline = time.monotonic() + 5.0
-    frame = get_stream_frame(camera_id, max_age=3.0)
+    # A manual photo should tolerate a short self-healing stream interruption.
+    start_streaming_mode(camera_id)
+    deadline = time.monotonic() + 20.0
+    frame = get_stream_frame(camera_id, max_age=4.0)
 
     while frame is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-        frame = get_stream_frame(camera_id, max_age=3.0)
+        node = get_node(camera_id)
+        if node and node.get("camera_pipeline_healthy") is False:
+            time.sleep(0.25)
+        else:
+            time.sleep(0.08)
+        start_streaming_mode(camera_id)
+        frame = get_stream_frame(camera_id, max_age=4.0)
 
     if frame is None:
-        raise RuntimeError("Streaming mode has no recent frame")
+        raise RuntimeError(
+            "Streaming mode has no recent frame after 20s recovery window"
+        )
 
     payload = bytes(frame["frame"])
     dt = now_local()
@@ -1923,10 +1932,17 @@ def camera_operation_worker() -> None:
                 detail = str(getattr(exc, "detail", exc))
                 item["status"] = "error"
                 item["error"] = detail[-4000:]
+                error_source = "camera_operation"
+                error_category = None
+                if item.get("kind") in {"stream_photo", "stream_video"}:
+                    error_source = "streaming_mode"
+                    error_category = "stream_unavailable"
+
                 record_runtime_error(
-                    "camera_operation",
+                    error_source,
                     detail,
                     str(item.get("camera_id") or ""),
+                    error_category,
                 )
             finally:
                 item["finished_at"] = now_local().isoformat()
@@ -3392,6 +3408,12 @@ def camera_health(node: dict[str, Any]) -> dict[str, Any]:
 
     if not bool(node.get("online")):
         add_issue("error", "offline", "Camera offline")
+    elif node.get("camera_pipeline_healthy") is False:
+        add_issue(
+            "error",
+            "camera_pipeline_unhealthy",
+            "Pipeline camera senza framebuffer · recovery automatico in corso",
+        )
     elif node.get("service_ready") is False:
         remaining_ms = int(node.get("startup_grace_remaining_ms") or 0)
         remaining_sec = max(0, (remaining_ms + 999) // 1000)
