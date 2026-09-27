@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.1.1")
+app = FastAPI(title="CamHub", version="1.1.2")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -53,6 +53,7 @@ stream_thread_lock = threading.RLock()
 stream_threads: dict[str, threading.Thread] = {}
 stream_stop_events: dict[str, threading.Event] = {}
 alarm_last_event: dict[str, float] = {}
+camera_maintenance_until: dict[str, float] = {}
 
 ota_job_lock = threading.RLock()
 ota_jobs: dict[str, dict[str, Any]] = {}
@@ -955,6 +956,36 @@ def clear_stream_frame(camera_id: str) -> None:
         stream_frame_cache.pop(camera_id, None)
 
 
+def _node_is_fresh(node: dict[str, Any], max_age_sec: float = 22.0) -> bool:
+    try:
+        seen = datetime.fromisoformat(str(node.get("last_seen") or ""))
+        return (now_local() - seen).total_seconds() <= max_age_sec
+    except Exception:
+        return False
+
+
+def _node_ready_for_stream(camera_id: str, node: dict[str, Any] | None) -> bool:
+    if not node or not _node_is_fresh(node):
+        return False
+
+    maintenance_until = float(
+        camera_maintenance_until.get(camera_id) or 0.0
+    )
+    if time.monotonic() < maintenance_until:
+        return False
+
+    if node.get("service_ready") is False:
+        return False
+
+    # Backward-compatible protection for pre-0.8.3 nodes that do not yet
+    # report service_ready explicitly.
+    uptime = float(node.get("uptime_sec") or 0.0)
+    if "service_ready" not in node and uptime > 0 and uptime < 8.0:
+        return False
+
+    return True
+
+
 def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
     reconnect_failures = 0
     outage_started: float | None = None
@@ -966,12 +997,22 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
                 break
 
             node = get_node(camera_id)
+
+            if not _node_ready_for_stream(camera_id, node):
+                # Power-up, intentional reboot, stale heartbeat and the
+                # firmware startup-grace period are not protocol errors.
+                reconnect_failures = 0
+                outage_started = None
+                clear_stream_frame(camera_id)
+                stop_event.wait(0.5)
+                continue
+
             stream_url = str((node or {}).get("stream_url") or "")
             if not stream_url:
                 reconnect_failures += 1
                 if outage_started is None:
                     outage_started = time.monotonic()
-                time.sleep(min(3.0, 0.5 * reconnect_failures))
+                stop_event.wait(min(3.0, 0.5 * reconnect_failures))
                 continue
 
             request = urllib.request.Request(
@@ -1034,6 +1075,14 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
                 ):
                     break
 
+                fresh_node = get_node(camera_id)
+                if not _node_ready_for_stream(camera_id, fresh_node):
+                    reconnect_failures = 0
+                    outage_started = None
+                    clear_stream_frame(camera_id)
+                    stop_event.wait(0.5)
+                    continue
+
                 reconnect_failures += 1
                 now_mono = time.monotonic()
                 if outage_started is None:
@@ -1042,9 +1091,9 @@ def _stream_reader(camera_id: str, stop_event: threading.Event) -> None:
                 outage_sec = now_mono - outage_started
 
                 # Connection loss is self-healed. Only surface it when it
-                # becomes a real outage rather than logging every reconnect.
+                # becomes a sustained outage of an otherwise ready camera.
                 if (
-                    outage_sec >= 12.0
+                    outage_sec >= 30.0
                     and now_mono - last_report_at >= 60.0
                 ):
                     record_runtime_error(
@@ -2771,6 +2820,9 @@ async def node_heartbeat(request: Request, x_cam_token: str | None = Header(defa
     payload["observed_ip"] = request.client.host if request.client else None
     save_node(camera_id, payload)
 
+    if payload.get("service_ready") is True:
+        camera_maintenance_until.pop(camera_id, None)
+
     if cfg.get("camera_mode") == "streaming":
         start_streaming_mode(camera_id)
 
@@ -2823,6 +2875,93 @@ async def node_alarm(
         "operation": item,
     }
 
+
+
+@app.post("/api/camera/{camera_id}/reboot")
+def reboot_camera(camera_id: str):
+    cfg = load_config()
+    node = get_node(camera_id)
+
+    if not node:
+        raise HTTPException(404, "Camera node is unknown")
+
+    if ota_camera_busy(camera_id) or bool(node.get("ota_in_progress")):
+        raise HTTPException(
+            409,
+            "Cannot reboot camera while OTA is active",
+        )
+
+    try:
+        seen = datetime.fromisoformat(str(node.get("last_seen") or ""))
+        if (now_local() - seen).total_seconds() >= 45:
+            raise HTTPException(409, "Camera is offline")
+    except ValueError as exc:
+        raise HTTPException(409, "Camera heartbeat is unavailable") from exc
+
+    with camera_operation_lock:
+        if camera_operation_active is not None or camera_operation_queue:
+            raise HTTPException(
+                409,
+                "Wait for camera operations to finish before rebooting",
+            )
+
+    reboot_url = str(node.get("reboot_url") or "")
+    if not reboot_url:
+        raise HTTPException(
+            409,
+            "Camera firmware does not support remote reboot yet",
+        )
+
+    previous_mode = str(cfg.get("camera_mode") or "automatic")
+    if previous_mode == "streaming":
+        stop_streaming_mode(camera_id, wait_sec=5.0)
+
+    # Suppress intentional disconnect/reconnect noise while the node reboots.
+    camera_maintenance_until[camera_id] = time.monotonic() + 75.0
+
+    req = urllib.request.Request(
+        reboot_url,
+        method="POST",
+        headers={
+            "User-Agent": "CamHub/1.1.2",
+            "X-Cam-Token": str(cfg["upload_token"]),
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read(8192).decode(
+                "utf-8",
+                errors="replace",
+            )
+    except urllib.error.HTTPError as exc:
+        camera_maintenance_until.pop(camera_id, None)
+        if previous_mode == "streaming":
+            start_streaming_mode(camera_id)
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(
+            502,
+            f"Camera rejected reboot: HTTP {exc.code} {detail}",
+        ) from exc
+    except Exception as exc:
+        camera_maintenance_until.pop(camera_id, None)
+        if previous_mode == "streaming":
+            start_streaming_mode(camera_id)
+        raise HTTPException(
+            502,
+            f"Unable to request camera reboot: {exc}",
+        ) from exc
+
+    return {
+        "ok": True,
+        "camera_id": camera_id,
+        "previous_mode": previous_mode,
+        "message": (
+            "Reboot requested. CamHub will wait for the new heartbeat "
+            "and startup-grace completion before reopening streaming."
+        ),
+        "camera_response": body[-2000:],
+    }
 
 
 @app.post("/api/ota/upload")
@@ -3227,6 +3366,17 @@ def camera_health(node: dict[str, Any]) -> dict[str, Any]:
 
     if not bool(node.get("online")):
         add_issue("error", "offline", "Camera offline")
+    elif node.get("service_ready") is False:
+        remaining_ms = int(node.get("startup_grace_remaining_ms") or 0)
+        remaining_sec = max(0, (remaining_ms + 999) // 1000)
+        add_issue(
+            "warning",
+            "startup_grace",
+            (
+                f"Camera in avvio"
+                + (f" · pronta tra ~{remaining_sec}s" if remaining_sec else "")
+            ),
+        )
 
     rssi = int(node.get("rssi") or -127)
     if bool(node.get("online")):
