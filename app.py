@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.1.4")
+app = FastAPI(title="CamHub", version="1.1.5")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -3246,6 +3246,8 @@ def ota_status():
                 "ota_partition": node.get("ota_partition"),
                 "service_ready": node.get("service_ready"),
                 "startup_grace_remaining_ms": node.get("startup_grace_remaining_ms"),
+                "camera_pipeline_healthy": node.get("camera_pipeline_healthy"),
+                "repair_mutex_timeouts": node.get("repair_mutex_timeouts"),
                 "reboot_capable": bool(node.get("reboot_url")),
                 "maintenance_active": (
                     time.monotonic()
@@ -3291,12 +3293,10 @@ def ota_apply(camera_id: str):
             "version": installed,
         }
 
-    if node.get("service_ready") is False:
-        raise HTTPException(
-            409,
-            "Camera is still stabilizing after startup; wait until it is ready",
-        )
-
+    # OTA is a control-plane operation and must remain available even when
+    # the image pipeline is unhealthy. A live heartbeat + OTA capability is
+    # sufficient; otherwise a broken sensor could prevent the very firmware
+    # update needed to repair it.
     if not bool(node.get("ota_capable")):
         raise HTTPException(
             409,
@@ -3340,7 +3340,7 @@ def ota_apply(camera_id: str):
         start_url + "?" + query,
         method="POST",
         headers={
-            "User-Agent": "CamHub/1.0",
+            "User-Agent": "CamHub/1.1.5-ota",
             "X-Cam-Token": str(cfg["upload_token"]),
         },
     )
