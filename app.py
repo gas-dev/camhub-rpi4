@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="1.0.2")
+app = FastAPI(title="CamHub", version="1.0.3")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -2777,6 +2777,82 @@ def ota_apply(camera_id: str):
     }
 
 
+def camera_health(node: dict[str, Any]) -> dict[str, Any]:
+    issues: list[dict[str, str]] = []
+    level = "ok"
+
+    def add_issue(severity: str, code: str, message: str) -> None:
+        nonlocal level
+        issues.append({
+            "severity": severity,
+            "code": code,
+            "message": message,
+        })
+        if severity == "error":
+            level = "error"
+        elif severity == "warning" and level == "ok":
+            level = "warning"
+
+    if not bool(node.get("online")):
+        add_issue("error", "offline", "Camera offline")
+
+    rssi = int(node.get("rssi") or -127)
+    if bool(node.get("online")):
+        if rssi <= -88:
+            add_issue("error", "wifi_critical", f"Wi-Fi molto debole ({rssi} dBm)")
+        elif rssi <= -80:
+            add_issue("warning", "wifi_weak", f"Wi-Fi debole ({rssi} dBm)")
+
+    min_heap = int(node.get("min_free_heap") or 0)
+    if min_heap > 0:
+        if min_heap < 30000:
+            add_issue(
+                "error",
+                "heap_critical",
+                f"Heap minimo molto basso ({min_heap // 1024} KB)",
+            )
+        elif min_heap < 50000:
+            add_issue(
+                "warning",
+                "heap_low",
+                f"Heap minimo basso ({min_heap // 1024} KB)",
+            )
+
+    reset_reason = str(node.get("reset_reason") or "").upper()
+    if reset_reason in {
+        "PANIC",
+        "INTERRUPT_WATCHDOG",
+        "TASK_WATCHDOG",
+        "OTHER_WATCHDOG",
+        "BROWNOUT",
+    }:
+        add_issue(
+            "error",
+            "abnormal_reset",
+            f"Ultimo reset anomalo: {reset_reason}",
+        )
+
+    recovery_failures = int(node.get("driver_recovery_failures") or 0)
+    if recovery_failures > 0:
+        add_issue(
+            "error",
+            "camera_recovery_failure",
+            f"Recovery driver camera falliti: {recovery_failures}",
+        )
+
+    labels = {
+        "ok": "OK",
+        "warning": "ATTENZIONE",
+        "error": "ERRORE",
+    }
+
+    return {
+        "level": level,
+        "label": labels[level],
+        "issues": issues,
+    }
+
+
 @app.get("/api/nodes")
 def api_nodes():
     now = now_local()
@@ -2792,6 +2868,7 @@ def api_nodes():
             node["ingest_fps"] = stream_state["source_fps"]
             node["stream_running"] = stream_state["running"]
             node["stream_frame_available"] = stream_state["frame_available"]
+            node["health"] = camera_health(node)
             nodes.append(node)
         except Exception:
             continue
