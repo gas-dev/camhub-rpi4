@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="2.0.0")
+app = FastAPI(title="CamHub", version="2.1.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -4725,6 +4725,7 @@ def api_status():
     latest = latest_jpg()
     backoff = cloud_backoff_status()
     return {
+        "camhub_version": app.version,
         "server_name": cfg["server_name"],
         "media_count": len(files),
         "data_mb": round(total_bytes / 1024 / 1024, 2),
