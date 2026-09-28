@@ -7,34 +7,40 @@
 <style>
 :root{
   color-scheme:dark;
-  --bg:#0b0e13;
-  --panel:#131820;
-  --panel2:#181f29;
-  --border:#2a3442;
-  --text:#edf2f7;
-  --muted:#9aa8b8;
-  --accent:#6eb6ff;
-  --ok:#77df91;
-  --bad:#ff8585;
-  --warn:#ffd27a;
+  --bg:#070b11;
+  --panel:rgba(18,25,35,.92);
+  --panel2:rgba(24,33,45,.96);
+  --border:rgba(133,158,188,.18);
+  --text:#f3f7fb;
+  --muted:#91a1b4;
+  --accent:#68b8ff;
+  --accent2:#8b7cff;
+  --ok:#67e49a;
+  --bad:#ff747d;
+  --warn:#ffd166;
+  --shadow:0 18px 45px rgba(0,0,0,.25);
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif}
+body{margin:0;background:
+radial-gradient(circle at 85% 0%,rgba(70,118,255,.12),transparent 28%),
+radial-gradient(circle at 15% 18%,rgba(46,184,160,.08),transparent 24%),
+linear-gradient(180deg,#0a0f17 0%,var(--bg) 55%,#05080d 100%);
+color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif}
 button,input,select{font:inherit}
-button{border:1px solid var(--border);background:#202938;color:var(--text);padding:10px 13px;border-radius:9px;cursor:pointer}
-button:hover{border-color:#526579}
-button.primary{background:#244b72;border-color:#376b9d}
+button{border:1px solid var(--border);background:linear-gradient(180deg,#202b3a,#18212d);color:var(--text);padding:10px 13px;border-radius:11px;cursor:pointer;transition:.18s ease;box-shadow:0 5px 16px rgba(0,0,0,.12)}
+button:hover{border-color:rgba(104,184,255,.55);transform:translateY(-1px)}
+button.primary{background:linear-gradient(135deg,#235b8e,#3157a8);border-color:rgba(104,184,255,.45)}
 button.danger{background:#552c32;border-color:#87424c}
 button:disabled{opacity:.42;cursor:not-allowed}
 input,select{width:100%;background:#0e131a;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 10px}
 label{display:block;color:var(--muted);font-size:13px;margin:10px 0 4px}
 a{color:var(--accent)}
 .shell{min-height:100vh;display:grid;grid-template-columns:220px 1fr}
-.sidebar{position:sticky;top:0;height:100vh;padding:20px 14px;border-right:1px solid var(--border);background:#10151c}
-.brand{font-size:22px;font-weight:700;margin:0 8px 4px}
+.sidebar{position:sticky;top:0;height:100vh;padding:22px 14px;border-right:1px solid var(--border);background:rgba(10,15,22,.82);backdrop-filter:blur(18px)}
+.brand{font-size:23px;font-weight:800;letter-spacing:-.5px;margin:0 8px 4px;background:linear-gradient(90deg,#fff,#8ecbff);-webkit-background-clip:text;background-clip:text;color:transparent}
 .subbrand{font-size:12px;color:var(--muted);margin:0 8px 22px}
 .nav button{display:block;width:100%;text-align:left;margin:4px 0;background:transparent;border-color:transparent}
-.nav button.active{background:#1d2733;border-color:#334154}
+.nav button.active{background:linear-gradient(90deg,rgba(70,142,205,.22),rgba(70,142,205,.07));border-color:rgba(104,184,255,.26);box-shadow:inset 3px 0 0 var(--accent)}
 .content{padding:22px;max-width:1500px;width:100%;margin:0 auto}
 .section{display:none}
 .section.active{display:block}
@@ -45,7 +51,8 @@ a{color:var(--accent)}
 .bad{color:var(--bad)}
 .warn{color:var(--warn)}
 .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px}
-.card{grid-column:span 6;background:var(--panel);border:1px solid var(--border);border-radius:13px;padding:16px}
+.card{grid-column:span 6;background:linear-gradient(145deg,var(--panel),rgba(13,19,28,.94));border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:var(--shadow);backdrop-filter:blur(10px)}
+.card:hover{border-color:rgba(104,184,255,.24)}
 .card.full{grid-column:1/-1}
 .card.third{grid-column:span 4}
 .card h2{font-size:17px;margin:0 0 12px}
@@ -70,7 +77,23 @@ th{color:var(--muted);font-weight:600}
 .progress{height:8px;background:#0c1117;border-radius:99px;overflow:hidden;min-width:120px}
 .progress>div{height:100%;background:var(--accent);width:0}
 .section-tabs{display:none}
-.version-badge{position:fixed;top:14px;right:18px;z-index:20;padding:7px 10px;border:1px solid var(--border);border-radius:9px;background:#101722;color:var(--muted);font-size:12px}
+.version-badge{position:fixed;top:14px;right:18px;z-index:20;padding:8px 11px;border:1px solid var(--border);border-radius:999px;background:rgba(12,19,29,.88);backdrop-filter:blur(12px);color:#c9d7e8;font-size:12px;box-shadow:0 8px 25px rgba(0,0,0,.2)}
+.status-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:rgba(255,255,255,.045);border:1px solid var(--border);font-size:12px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.card-head h2{margin:0}
+.alarm-feed{display:grid;gap:9px}
+.alarm-item{display:grid;grid-template-columns:72px minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px;border:1px solid rgba(133,158,188,.14);border-radius:14px;background:rgba(7,12,18,.5);transition:.16s ease}
+.alarm-item:hover{border-color:rgba(255,116,125,.34);background:rgba(255,116,125,.045)}
+.alarm-thumb{width:72px;height:52px;border-radius:10px;object-fit:cover;background:#080b10;border:1px solid var(--border)}
+.alarm-icon{width:72px;height:52px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,rgba(255,116,125,.16),rgba(255,209,102,.06));border:1px solid rgba(255,116,125,.2);font-size:22px}
+.alarm-title{font-weight:700;margin-bottom:3px}
+.alarm-meta{font-size:12px;color:var(--muted);line-height:1.45}
+.profile-switch{display:flex;gap:5px;flex-wrap:wrap}
+.profile-btn{padding:7px 9px;border-radius:9px;font-size:11px;white-space:nowrap}
+.profile-btn.active{border-color:rgba(103,228,154,.58);background:rgba(103,228,154,.12);color:var(--ok)}
+.profile-help{font-size:11px;color:var(--muted);margin-top:5px}
+.kpi{font-size:24px;font-weight:800;letter-spacing:-.5px}
+@media(max-width:650px){.alarm-item{grid-template-columns:56px minmax(0,1fr)}.alarm-thumb,.alarm-icon{width:56px;height:46px}.alarm-item>button{grid-column:1/-1}}
 @media(max-width:900px){
   .shell{display:block}
   .sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--border)}
@@ -94,7 +117,7 @@ th{color:var(--muted);font-weight:600}
       <button data-page="media">Media</button>
       <button data-page="camera">Camera</button>
       <button data-page="cloud">Cloud</button>
-      <button data-page="firmware">Firmware / OTA</button>
+      <button data-page="firmware">Gestione Cams</button>
       <button data-page="system">Sistema</button>
     </nav>
   </aside>
@@ -148,6 +171,14 @@ th{color:var(--muted);font-weight:600}
             <button onclick="syncPending()">Sincronizza Drive</button>
             <button onclick="cleanupOld()">Pulizia retention</button>
           </div>
+        </div>
+
+        <div class="card full">
+          <div class="card-head">
+            <div><h2>Ultimi allarmi</h2><div class="muted" style="font-size:12px;margin-top:3px">Gli ultimi eventi rilevati, con foto/video e stato archivio.</div></div>
+            <button onclick="document.querySelector('[data-page=&quot;media&quot;]').click()">Vedi tutti</button>
+          </div>
+          <div id="recentAlarms" class="alarm-feed"><div class="muted">Nessun allarme recente.</div></div>
         </div>
 
         <div class="card full" id="liveCard" style="display:none">
@@ -215,6 +246,7 @@ th{color:var(--muted);font-weight:600}
         <div class="card full">
           <h2>Modalità Allarme</h2>
           <div class="notice muted">Il movimento viene analizzato localmente sulla ESP32 in QVGA grayscale. In assenza di movimento non viene inviato uno stream video al Raspberry.</div>
+          <div id="alarmProfileSummary" class="notice muted">Profilo energetico: caricamento...</div>
           <div class="three">
             <div><label>Video allarme, secondi</label><input id="alarm_video_sec" type="number" min="1" max="600"><div class="muted" style="margin-top:5px">Fino a 10 minuti</div></div>
             <div><label>% pixel modificati</label><input id="motion_threshold_pct" type="number" min="1" max="80"></div>
@@ -256,7 +288,7 @@ th{color:var(--muted);font-weight:600}
     </section>
 
     <section id="page-firmware" class="section">
-      <div class="pagehead"><div><h1>Firmware / OTA</h1><div class="muted">Distribuzione firmware CamNode dal Raspberry</div></div></div>
+      <div class="pagehead"><div><h1>Gestione Cams</h1><div class="muted">Telecamere, profili Allarme, diagnostica essenziale e aggiornamenti OTA</div></div></div>
       <div class="grid">
         <div class="card">
           <h2>Firmware disponibile</h2>
@@ -268,10 +300,10 @@ th{color:var(--muted);font-weight:600}
         </div>
 
         <div class="card">
-          <h2>Come funziona</h2>
+          <h2>Gestione telecamere</h2>
           <div class="statusline muted">
-            CamHub conserva il firmware, calcola SHA-256 e lo consegna alla camera solo quando richiedi l'aggiornamento.<br><br>
-            La camera scarica il file nella partizione OTA inattiva, verifica SHA-256, attiva il nuovo slot e riavvia. CamHub considera concluso l'aggiornamento solo quando riceve il nuovo heartbeat.
+            I profili <b>Realtime</b>, <b>Light</b> ed <b>Eco</b> appartengono esclusivamente alla modalità Allarme. Light esegue il controllo ordinario ogni ~2 s; Eco ogni ~6 s. Un primo movimento sospetto viene sempre confermato rapidamente senza attendere un altro ciclo completo.<br><br>
+            L'OTA continua a usare lo Standby tecnico con driver camera spento, esattamente come prima.
           </div>
           <div class="notice warn">Le camere precedenti al firmware 0.8.0 richiedono una sola installazione USB della nuova tabella dual-slot. Dopo quella migrazione gli aggiornamenti normali possono essere OTA.</div>
         </div>
@@ -279,7 +311,7 @@ th{color:var(--muted);font-weight:600}
         <div class="card full scroll">
           <h2>Telecamere</h2>
           <table>
-            <thead><tr><th>Camera</th><th>Stato</th><th>Installato</th><th>Boot</th><th>Reset</th><th>Partizione</th><th>OTA</th><th>Progresso</th><th>Azione</th></tr></thead>
+            <thead><tr><th>Camera</th><th>Stato</th><th>Profilo Allarme</th><th>Installato</th><th>Boot</th><th>Reset</th><th>Partizione</th><th>OTA</th><th>Progresso</th><th>Azione</th></tr></thead>
             <tbody id="firmwareCameras"></tbody>
           </table>
         </div>
