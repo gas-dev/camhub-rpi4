@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="2.1.0")
+app = FastAPI(title="CamHub", version="2.2.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
     "camera_mode": "automatic",
     "event_video_sec": 10,
     "alarm_video_sec": 10,
+    "alarm_power_profile": "realtime",
     "motion_threshold_pct": 8,
     "motion_pixel_delta": 24,
     "motion_sample_ms": 500,
@@ -127,6 +128,7 @@ class ConfigModel(BaseModel):
     camera_mode: str = "automatic"
     event_video_sec: int = 10
     alarm_video_sec: int = 10
+    alarm_power_profile: str = "realtime"
     motion_threshold_pct: int = 8
     motion_pixel_delta: int = 24
     motion_sample_ms: int = 500
@@ -1079,13 +1081,14 @@ def _stream_reader(
                 },
             )
 
+            received_frame = False
+
             try:
                 with urllib.request.urlopen(
                     request,
                     timeout=8,
                 ) as response:
                     buffer = b""
-                    received_frame = False
 
                     while not stop_event.is_set():
                         if load_config().get("camera_mode") != "streaming":
@@ -2989,6 +2992,21 @@ def set_config(cfg: ConfigModel):
             "alarm_video_sec must be 1..600",
         )
 
+    data["alarm_power_profile"] = str(
+        data.get("alarm_power_profile")
+        or "realtime"
+    ).strip().lower()
+
+    if data["alarm_power_profile"] not in {
+        "realtime",
+        "light",
+        "eco",
+    }:
+        raise HTTPException(
+            400,
+            "alarm_power_profile must be realtime, light or eco",
+        )
+
     if not 1 <= data["motion_threshold_pct"] <= 80:
         raise HTTPException(
             400,
@@ -3124,6 +3142,7 @@ def node_config(camera_id: str, x_cam_token: str | None = Header(default=None)):
         "snapshot_source": "server_exclusive_queue",
         "camera_mode": cfg["camera_mode"],
         "alarm_video_sec": cfg["alarm_video_sec"],
+        "alarm_power_profile": cfg["alarm_power_profile"],
         "motion_threshold_pct": cfg["motion_threshold_pct"],
         "motion_pixel_delta": cfg["motion_pixel_delta"],
         "motion_sample_ms": cfg["motion_sample_ms"],
@@ -4336,6 +4355,7 @@ def push_config_to_node(
         f"&fps={cfg['stream_max_fps']}"
         f"&interval={cfg['snapshot_interval_sec']}"
         f"&alarm_video={cfg['alarm_video_sec']}"
+        f"&alarm_profile={urllib.parse.quote(str(cfg.get('alarm_power_profile') or 'realtime'))}"
         f"&motion_pct={cfg['motion_threshold_pct']}"
         f"&motion_delta={cfg['motion_pixel_delta']}"
         f"&motion_ms={cfg['motion_sample_ms']}"
@@ -4345,7 +4365,7 @@ def push_config_to_node(
     req = urllib.request.Request(
         base + query,
         headers={
-            "User-Agent": "CamHub/2.0-control",
+            "User-Agent": "CamHub/2.2-control",
             "Connection": "close",
             "X-Cam-Token": str(cfg["upload_token"]),
         },
@@ -4530,6 +4550,128 @@ def set_camera_mode(mode: str):
     result["active_mode"] = (node or {}).get("active_mode")
 
     return result
+
+
+def wait_for_node_alarm_profile(
+    camera_id: str,
+    profile: str,
+    timeout_sec: float = 12.0,
+) -> tuple[bool, dict[str, Any] | None]:
+    deadline = time.monotonic() + timeout_sec
+    latest: dict[str, Any] | None = None
+
+    while time.monotonic() < deadline:
+        latest = get_node(camera_id)
+
+        if (
+            _node_mode_ready(latest, "alarm")
+            and str(
+                (latest or {}).get("alarm_power_profile")
+                or ""
+            ).lower() == profile
+        ):
+            return True, latest
+
+        time.sleep(0.25)
+
+    return False, latest
+
+
+@app.post("/api/camera/{camera_id}/alarm-profile/{profile}")
+def set_alarm_power_profile(
+    camera_id: str,
+    profile: str,
+):
+    normalized = profile.strip().lower()
+
+    if normalized not in {
+        "realtime",
+        "light",
+        "eco",
+    }:
+        raise HTTPException(
+            400,
+            "Profile must be realtime, light or eco",
+        )
+
+    cfg = load_config()
+
+    if str(cfg.get("camera_mode") or "") != "alarm":
+        raise HTTPException(
+            409,
+            (
+                "Alarm power profiles are available only "
+                "while the camera is in Alarm mode"
+            ),
+        )
+
+    configured_camera = str(
+        cfg.get("camera_id")
+        or "CAM01"
+    )
+
+    if camera_id != configured_camera:
+        raise HTTPException(
+            409,
+            "This CamHub instance is not configured for that camera",
+        )
+
+    if ota_camera_busy(camera_id):
+        raise HTTPException(
+            409,
+            "Camera firmware update is in progress",
+        )
+
+    node = get_node(camera_id)
+
+    if not _node_mode_ready(node, "alarm"):
+        raise HTTPException(
+            409,
+            "Camera must be READY in Alarm mode before changing profile",
+        )
+
+    cfg["alarm_power_profile"] = normalized
+    save_config(cfg)
+
+    accepted, message = push_config_to_node(
+        camera_id,
+        cfg,
+    )
+
+    if not accepted:
+        raise HTTPException(
+            503,
+            "Camera did not accept alarm profile: " + message,
+        )
+
+    applied, node = wait_for_node_alarm_profile(
+        camera_id,
+        normalized,
+        timeout_sec=12.0,
+    )
+
+    if not applied:
+        raise HTTPException(
+            504,
+            (
+                "Alarm profile was accepted but not confirmed "
+                "by CamNode heartbeat within 12s"
+            ),
+        )
+
+    return {
+        "ok": True,
+        "camera_id": camera_id,
+        "camera_mode": "alarm",
+        "alarm_power_profile": normalized,
+        "effective_sample_ms": (
+            node or {}
+        ).get("alarm_effective_sample_ms"),
+        "wifi_sleep": bool(
+            (node or {}).get("alarm_wifi_sleep")
+        ),
+        "camera_message": message,
+    }
 
 
 @app.get("/api/camera/queue")
