@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 2.1.0
+## Current version: 2.2.0
 
 CamHub 2.x uses an acknowledged state-machine protocol with CamNode 1.x. The complete contract is in `CAMERA_ARCHITECTURE_V2.md`.
 
@@ -687,3 +687,20 @@ Camera resolution labels include both the standard name and pixel dimensions:
     UXGA — 1600 × 1200
 
 Streaming diagnostics distinguish requested FPS, CamNode measured produced FPS and Raspberry/CamHub ingest FPS.
+
+
+## CamHub 2.2
+
+The existing acknowledged protocol is unchanged: CamHub sends configuration through the current control path and CamNode heartbeat remains the authoritative confirmation.
+
+The former Firmware / OTA page is presented as Gestione Cams. The camera list includes alarm-only controls for:
+
+    Realtime
+    Standby Light (~2 s)
+    Standby Eco (~6 s)
+
+These controls are enabled only while a CamNode 1.2+ camera is READY in Alarm mode. Technical Standby used for OTA remains separate.
+
+The overview includes a modern recent-alarm feed with the latest alarm media, thumbnail when available, timestamp, camera, stored alarm profile and cloud state. Alarm JPEG/video metadata records the alarm power profile for new events.
+
+The dashboard also receives a visual refresh with softer panels, clearer status hierarchy and improved camera-management controls.
