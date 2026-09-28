@@ -130,7 +130,7 @@ th{color:var(--muted);font-weight:600}
         <div class="card full">
           <h2>Modalità</h2>
           <div class="mode-row">
-            <button id="modeStandby" class="mode" onclick="setMode('standby')"><b>Standby</b><span class="muted">Solo rete, heartbeat, comandi e OTA. Driver camera spento.</span></button>
+            <button id="modeStandby" class="mode" onclick="setMode('standby')"><b>Standby tecnico</b><span class="muted">Manutenzione/OTA: rete attiva, driver camera spento. Separato dai profili Allarme.</span></button>
             <button id="modeAutomatic" class="mode" onclick="setMode('automatic')"><b>Automatico</b><span class="muted">Una foto all'intervallo impostato, nessuno stream continuo.</span></button>
             <button id="modeStreaming" class="mode" onclick="setMode('streaming')"><b>Streaming</b><span class="muted">Un solo flusso condiviso per live, foto e video.</span></button>
             <button id="modeAlarm" class="mode" onclick="setMode('alarm')"><b>Allarme</b><span class="muted">Motion detection locale; foto + video solo su evento.</span></button>
@@ -339,7 +339,7 @@ let quickVideoInitialized=false;
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
 function fmtDuration(sec){sec=Math.max(0,Number(sec||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=Math.floor(sec%60);return(d?d+'g ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
-function alarmProfileLabel(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Light · ~2 s':(p==='eco'?'Eco · ~6 s':'Realtime')}
+function alarmProfileLabel(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Standby Light · ~2 s':(p==='eco'?'Standby Eco · ~6 s':'Realtime')}
 function alarmProfileDetail(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Wi-Fi sleep · controllo ordinario ogni ~2 s':(p==='eco'?'Wi-Fi sleep · controllo ordinario ogni ~6 s':'Rilevamento continuo secondo il campionamento configurato')}
 function fmtEventTime(v){try{const d=new Date(v);if(Number.isNaN(d.getTime()))return String(v||'—');return d.toLocaleString('it-IT',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch(e){return String(v||'—')}}
 function renderRecentAlarms(items){
@@ -739,7 +739,7 @@ async function refreshFirmware(){
       const profileSupported=!!cam.alarm_power_profile;
       const profileEnabled=cam.online&&activeMode==='alarm'&&nodeState==='ready'&&!otaActive&&!maintenance&&profileSupported;
       const profileCell=profileSupported?
-        '<div class="profile-switch">'+['realtime','light','eco'].map(p=>'<button class="profile-btn '+(profile===p?'active':'')+'" '+(profileEnabled?'':'disabled ')+'onclick="setAlarmProfile('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+','+JSON.stringify(p).replace(/"/g,'&quot;')+')">'+(p==='realtime'?'Realtime':(p==='light'?'Light 2s':'Eco 6s'))+'</button>').join('')+'</div>'+
+        '<div class="profile-switch">'+['realtime','light','eco'].map(p=>'<button class="profile-btn '+(profile===p?'active':'')+'" '+(profileEnabled?'':'disabled ')+'onclick="setAlarmProfile('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+','+JSON.stringify(p).replace(/"/g,'&quot;')+')">'+(p==='realtime'?'Realtime':(p==='light'?'Standby Light 2s':'Standby Eco 6s'))+'</button>').join('')+'</div>'+
         '<div class="profile-help">'+(activeMode==='alarm'?'Effettivo '+esc(cam.alarm_effective_sample_ms??'—')+' ms · Wi-Fi sleep '+(cam.alarm_wifi_sleep?'ON':'OFF'):'Disponibile solo in modalità Allarme')+'</div>':
         '<span class="muted">Richiede CamNode 1.2+</span>';
       const actionParts=[];
