@@ -1843,6 +1843,12 @@ def _finalize_recorded_video(
         "stopped_early": capture_duration < max(0.0, seconds - 0.5),
     }
 
+    if str(event_name).lower().startswith("alarm"):
+        extra["alarm_power_profile"] = str(
+            load_config().get("alarm_power_profile")
+            or "realtime"
+        )
+
     meta = register_media(
         out_path,
         camera_id,
@@ -2289,6 +2295,7 @@ def recent_items(limit: int = 50) -> list[dict[str, Any]]:
                 "video" if path.suffix.lower() == ".mp4" else ("error" if path.suffix.lower() == ".txt" else "image"),
             ),
             "source": meta.get("source"),
+            "alarm_power_profile": meta.get("alarm_power_profile"),
             "cloud_error": meta.get("cloud_error"),
             "cloud_error_at": meta.get("cloud_error_at"),
             "error_message": meta.get("error_message"),
@@ -3787,6 +3794,11 @@ def ota_status():
                 "state": node.get("state"),
                 "desired_mode": node.get("desired_mode"),
                 "active_mode": node.get("active_mode") or node.get("mode"),
+                "alarm_power_profile": node.get("alarm_power_profile"),
+                "alarm_effective_sample_ms": node.get("alarm_effective_sample_ms"),
+                "alarm_wifi_sleep": node.get("alarm_wifi_sleep"),
+                "alarm_idle_cycles": node.get("alarm_idle_cycles"),
+                "alarm_rapid_confirmations": node.get("alarm_rapid_confirmations"),
                 "camera_ready": node.get("camera_ready"),
                 "camera_driver_on": node.get("camera_driver_on"),
                 "camera_pipeline_healthy": node.get("camera_pipeline_healthy"),
@@ -4304,13 +4316,19 @@ async def upload_raw_image(
         event_type,
     )
     source = "alarm_node_upload" if event_type == "alarm" else "raw_jpeg"
+    extra_metadata = dict(provenance)
+    if str(event_type).lower().startswith("alarm"):
+        extra_metadata["alarm_power_profile"] = str(
+            cfg.get("alarm_power_profile")
+            or "realtime"
+        )
     meta = register_media(
         out_path,
         camera,
         event_type,
         dt,
         source,
-        provenance,
+        extra_metadata,
     )
     return {"ok": True, "file": out_path.name, "relative": out_path.relative_to(DATA_DIR).as_posix(), "size": len(payload), "sha256": meta["sha256"]}
 
