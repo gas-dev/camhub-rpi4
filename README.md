@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 2.0.0
+## Current version: 2.1.0
 
 CamHub 2.x uses an acknowledged state-machine protocol with CamNode 1.x. The complete contract is in `CAMERA_ARCHITECTURE_V2.md`.
 
@@ -671,3 +671,19 @@ The Overview camera card exposes framebuffer recovery counters, sensor power cyc
 CamHub now allows up to 20 seconds for the node to complete a camera mode transition and retries transient HTTP 503 responses up to three times.
 
 This complements CamNode 0.8.5, which releases the long-lived Streaming camera mutex before applying a new mode or camera configuration.
+
+
+## CamHub 2.1 dashboard
+
+The dashboard shows the CamHub application version persistently in the upper-right corner.
+
+Camera resolution labels include both the standard name and pixel dimensions:
+
+    VGA  — 640 × 480
+    SVGA — 800 × 600
+    XGA  — 1024 × 768
+    HD   — 1280 × 720
+    SXGA — 1280 × 1024
+    UXGA — 1600 × 1200
+
+Streaming diagnostics distinguish requested FPS, CamNode measured produced FPS and Raspberry/CamHub ingest FPS.
