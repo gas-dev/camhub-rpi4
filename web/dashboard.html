@@ -70,18 +70,21 @@ th{color:var(--muted);font-weight:600}
 .progress{height:8px;background:#0c1117;border-radius:99px;overflow:hidden;min-width:120px}
 .progress>div{height:100%;background:var(--accent);width:0}
 .section-tabs{display:none}
+.version-badge{position:fixed;top:14px;right:18px;z-index:20;padding:7px 10px;border:1px solid var(--border);border-radius:9px;background:#101722;color:var(--muted);font-size:12px}
 @media(max-width:900px){
   .shell{display:block}
   .sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--border)}
   .nav{display:flex;gap:5px;overflow:auto}
   .nav button{width:auto;white-space:nowrap}
-  .content{padding:14px}
+  .content{padding:48px 14px 14px}
+  .version-badge{top:8px;right:10px}
   .card,.card.third{grid-column:1/-1}
   .two,.three,.mode-row{grid-template-columns:1fr}
 }
 </style>
 </head>
 <body>
+<div id="camhubVersion" class="version-badge">CamHub v—</div>
 <div class="shell">
   <aside class="sidebar">
     <div class="brand">CamHub</div>
@@ -185,7 +188,14 @@ th{color:var(--muted);font-weight:600}
         <div class="card">
           <h2>Immagine e video</h2>
           <label>Risoluzione</label>
-          <select id="camera_frame_size"><option>VGA</option><option>SVGA</option><option>XGA</option><option>HD</option><option>SXGA</option><option>UXGA</option></select>
+          <select id="camera_frame_size">
+            <option value="VGA">VGA — 640 × 480</option>
+            <option value="SVGA">SVGA — 800 × 600</option>
+            <option value="XGA">XGA — 1024 × 768</option>
+            <option value="HD">HD — 1280 × 720</option>
+            <option value="SXGA">SXGA — 1280 × 1024</option>
+            <option value="UXGA">UXGA — 1600 × 1200</option>
+          </select>
           <label>Qualità JPEG (4 migliore, 30 più compressa)</label><input id="jpeg_quality" type="number" min="4" max="30">
           <label>FPS streaming/video</label><input id="stream_max_fps" type="number" min="1" max="15">
           <label>Durata video manuale predefinita, secondi</label><input id="event_video_sec" type="number" min="1" max="3600">
@@ -415,6 +425,7 @@ async function refresh(){
 
     cfg=c;
     recentMedia=recent;
+    document.getElementById('camhubVersion').textContent='CamHub v'+String(st.camhub_version||'—');
     nodeCache=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0]||null;
 
     const numberFields=['snapshot_interval_sec','jpeg_quality','stream_max_fps','brightness','contrast','saturation','event_video_sec','alarm_video_sec','motion_threshold_pct','motion_pixel_delta','motion_sample_ms','motion_cooldown_sec','retention_days','cloud_batch_delay_sec','cloud_rate_limit_backoff_sec','cloud_tps_limit'];
@@ -448,7 +459,8 @@ async function refresh(){
         'Firmware: <b>'+esc(n.firmware||'')+'</b> · Boot #'+esc(n.boot_count??'—')+' · Uptime '+fmtDuration(n.uptime_sec)+'<br>'+
         'Stato: <b class="'+stateClass+'">'+esc(nodeState.toUpperCase())+'</b> · desiderata <b>'+esc(desired)+'</b> · attiva <b>'+esc(active)+'</b><br>'+
         'Driver camera: '+(driverOn?'<span class="ok">ON</span>':'OFF')+' · pipeline: '+(cameraReady?'<span class="ok">READY</span>':(active==='standby'?'<span class="muted">SPENTA</span>':'<span class="warn">NON PRONTA</span>'))+'<br>'+
-        'Ultimo frame nodo: '+(latestAge>=0?latestAge+' ms fa':'—')+' · seq '+esc(n.latest_frame_seq??0)+' · ingest Raspberry '+Number(n.ingest_fps||0).toFixed(1)+' fps · '+(n.stream_frame_available?'<span class="ok">FRAME OK</span>':'nessun frame')+'<br>'+
+        'FPS: richiesti <b>'+esc(n.stream_fps_requested??cfg.stream_max_fps??'—')+'</b> · camera reali <b>'+Number(n.stream_fps_measured||0).toFixed(2)+'</b> · CamHub ingest <b>'+Number(n.ingest_fps||0).toFixed(2)+'</b><br>'+
+        'Ultimo frame nodo: '+(latestAge>=0?latestAge+' ms fa':'—')+' · seq '+esc(n.latest_frame_seq??0)+' · '+(n.stream_frame_available?'<span class="ok">FRAME OK</span>':'nessun frame')+'<br>'+
         'Frame camera: '+esc(n.frame_capture_success??n.capture_success??0)+' / '+esc(n.frame_capture_attempts??n.capture_requests??0)+' · falliti '+esc(n.frame_capture_failures??n.camera_fb_get_failures??0)+'<br>'+
         'JPEG: ultimo '+fmtBytes(n.last_jpeg_bytes||0)+' · max '+fmtBytes(n.max_jpeg_bytes_seen||0)+' · oversize '+esc(n.oversize_jpeg_frames??0)+' · acquisizione '+esc(n.last_capture_duration_ms??0)+' ms (max '+esc(n.max_capture_duration_ms??0)+' ms)<br>'+
         'XCLK camera: '+(n.camera_xclk_hz?Number(n.camera_xclk_hz/1000000).toFixed(0)+' MHz':'—')+' · buffer stream ESP '+esc(n.stream_copy_buffers??'—')+' · ultimo frame valido '+(Number(n.last_good_frame_age_ms)>=0?esc(n.last_good_frame_age_ms)+' ms fa':'—')+'<br>'+
