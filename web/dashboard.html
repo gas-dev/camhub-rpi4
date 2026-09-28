@@ -339,6 +339,39 @@ let quickVideoInitialized=false;
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
 function fmtDuration(sec){sec=Math.max(0,Number(sec||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=Math.floor(sec%60);return(d?d+'g ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
+function alarmProfileLabel(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Light · ~2 s':(p==='eco'?'Eco · ~6 s':'Realtime')}
+function alarmProfileDetail(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Wi-Fi sleep · controllo ordinario ogni ~2 s':(p==='eco'?'Wi-Fi sleep · controllo ordinario ogni ~6 s':'Rilevamento continuo secondo il campionamento configurato')}
+function fmtEventTime(v){try{const d=new Date(v);if(Number.isNaN(d.getTime()))return String(v||'—');return d.toLocaleString('it-IT',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch(e){return String(v||'—')}}
+function renderRecentAlarms(items){
+  const box=document.getElementById('recentAlarms');if(!box)return;
+  const alarms=(items||[]).filter(x=>String(x.event_type||'').toLowerCase().startsWith('alarm')&&x.media_type!=='error')
+    .sort((a,b)=>Date.parse(b.captured_at||0)-Date.parse(a.captured_at||0));
+  const groups=[];
+  alarms.forEach(item=>{
+    const t=Date.parse(item.captured_at||0)||0;
+    const last=groups[groups.length-1];
+    if(last&&last.camera_id===item.camera_id&&Math.abs(last.time-t)<=30000){
+      last.items.push(item);last.time=Math.max(last.time,t);
+      if(item.media_type==='image'&&!last.image)last.image=item;
+      if(item.media_type==='video'&&!last.video)last.video=item;
+      if(!last.profile&&item.alarm_power_profile)last.profile=item.alarm_power_profile;
+    }else if(groups.length<5){
+      groups.push({camera_id:item.camera_id||'CAM',time:t,items:[item],image:item.media_type==='image'?item:null,video:item.media_type==='video'?item:null,profile:item.alarm_power_profile||null,captured_at:item.captured_at});
+    }
+  });
+  if(!groups.length){box.innerHTML='<div class="muted">Nessun allarme recente.</div>';return}
+  box.innerHTML=groups.slice(0,5).map(g=>{
+    const primary=g.video||g.image||g.items[0];
+    const thumb=g.image?'<img class="alarm-thumb" src="/data/'+encodeURI(g.image.relative)+'?t='+encodeURIComponent(g.time)+'" alt="Allarme">':'<div class="alarm-icon">!</div>';
+    const media=[g.image?'foto':'',g.video?'video':''].filter(Boolean).join(' + ')||'evento';
+    const cloud=g.items.some(x=>x.cloud_status==='ERROR')?'Cloud errore':(g.items.every(x=>x.cloud_status==='SYNCED')?'Drive sincronizzato':esc(g.items[0]?.cloud_status||'locale'));
+    const profile=g.profile?alarmProfileLabel(g.profile):'Profilo non registrato';
+    return '<div class="alarm-item">'+thumb+
+      '<div><div class="alarm-title"><span class="bad">●</span> '+esc(g.camera_id)+' · Movimento rilevato</div>'+
+      '<div class="alarm-meta">'+esc(fmtEventTime(g.captured_at))+' · '+esc(media)+' · '+esc(profile)+'<br>'+esc(cloud)+'</div></div>'+
+      '<button onclick="window.open(\'/data/'+encodeURI(primary.relative)+'\',\'_blank\')">Apri</button></div>';
+  }).join('');
+}
 function apiErrorText(r){return r.json().then(j=>j.detail||j.error||JSON.stringify(j)).catch(()=>r.text()).catch(()=>'Errore HTTP '+r.status)}
 
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>{
@@ -438,7 +471,7 @@ function renderMode(st){
   if(mode==='standby')text='<span class="ok"><b>STANDBY</b></span> · nodo collegato, driver camera spento, pronto per comandi/OTA';
   if(mode==='automatic')text='<span class="ok"><b>AUTOMATICO</b></span> · una foto ogni '+cfg.snapshot_interval_sec+' secondi';
   if(mode==='streaming')text='<span class="ok"><b>STREAMING</b></span> · un solo flusso condiviso per live, foto e video';
-  if(mode==='alarm')text='<span class="ok"><b>ALLARME</b></span> · rilevamento locale · foto + video '+cfg.alarm_video_sec+' s su movimento';
+  if(mode==='alarm')text='<span class="ok"><b>ALLARME</b></span> · '+esc(alarmProfileLabel((nodeCache&&nodeCache.alarm_power_profile)||cfg.alarm_power_profile))+' · foto + video '+cfg.alarm_video_sec+' s su movimento';
   if(nodeCache&&nodeCache.state&&String(nodeCache.active_mode||nodeCache.mode||'')!==mode){
     text+='<br><span class="warn">Transizione: nodo '+esc(nodeCache.state)+' · attiva '+esc(nodeCache.active_mode||nodeCache.mode||'—')+'</span>';
   }
@@ -457,6 +490,7 @@ async function refresh(){
 
     cfg=c;
     recentMedia=recent;
+    renderRecentAlarms(recentMedia);
     document.getElementById('camhubVersion').textContent='CamHub v'+String(st.camhub_version||'—');
     nodeCache=nodes.find(x=>x.camera_id===cfg.camera_id)||nodes[0]||null;
 
@@ -468,6 +502,13 @@ async function refresh(){
 
     renderMode(st);
     renderErrors(st.errors||{});
+    const profileSummary=document.getElementById('alarmProfileSummary');
+    if(profileSummary){
+      const liveProfile=(nodeCache&&nodeCache.alarm_power_profile)||cfg.alarm_power_profile||'realtime';
+      const applicable=String(cfg.camera_mode||'')==='alarm';
+      profileSummary.innerHTML='Profilo energetico: <b>'+esc(alarmProfileLabel(liveProfile))+'</b> · '+esc(alarmProfileDetail(liveProfile))+
+        (applicable?'':'<br><span class="muted">I profili Light/Eco vengono applicati solo quando la modalità operativa è Allarme.</span>');
+    }
 
     const n=nodeCache;
     if(n){
@@ -491,6 +532,7 @@ async function refresh(){
         'Firmware: <b>'+esc(n.firmware||'')+'</b> · Boot #'+esc(n.boot_count??'—')+' · Uptime '+fmtDuration(n.uptime_sec)+'<br>'+
         'Stato: <b class="'+stateClass+'">'+esc(nodeState.toUpperCase())+'</b> · desiderata <b>'+esc(desired)+'</b> · attiva <b>'+esc(active)+'</b><br>'+
         'Driver camera: '+(driverOn?'<span class="ok">ON</span>':'OFF')+' · pipeline: '+(cameraReady?'<span class="ok">READY</span>':(active==='standby'?'<span class="muted">SPENTA</span>':'<span class="warn">NON PRONTA</span>'))+'<br>'+
+        (active==='alarm'?'Profilo Allarme: <b>'+esc(alarmProfileLabel(n.alarm_power_profile||cfg.alarm_power_profile))+'</b> · campionamento effettivo '+esc(n.alarm_effective_sample_ms??'—')+' ms · Wi-Fi sleep '+(n.alarm_wifi_sleep?'<span class="ok">ON</span>':'OFF')+'<br>':'')+
         'FPS: richiesti <b>'+esc(n.stream_fps_requested??cfg.stream_max_fps??'—')+'</b> · camera reali <b>'+Number(n.stream_fps_measured||0).toFixed(2)+'</b> · CamHub ingest <b>'+Number(n.ingest_fps||0).toFixed(2)+'</b><br>'+
         'Ultimo frame nodo: '+(latestAge>=0?latestAge+' ms fa':'—')+' · seq '+esc(n.latest_frame_seq??0)+' · '+(n.stream_frame_available?'<span class="ok">FRAME OK</span>':'nessun frame')+'<br>'+
         'Frame camera: '+esc(n.frame_capture_success??n.capture_success??0)+' / '+esc(n.frame_capture_attempts??n.capture_requests??0)+' · falliti '+esc(n.frame_capture_failures??n.camera_fb_get_failures??0)+'<br>'+
@@ -693,6 +735,13 @@ async function refreshFirmware(){
       const startup=['booting','transition'].includes(nodeState);
       const recovery=['recovering','error'].includes(nodeState);
       const maintenance=!!cam.maintenance_active;
+      const profile=String(cam.alarm_power_profile||'').toLowerCase();
+      const profileSupported=!!cam.alarm_power_profile;
+      const profileEnabled=cam.online&&activeMode==='alarm'&&nodeState==='ready'&&!otaActive&&!maintenance&&profileSupported;
+      const profileCell=profileSupported?
+        '<div class="profile-switch">'+['realtime','light','eco'].map(p=>'<button class="profile-btn '+(profile===p?'active':'')+'" '+(profileEnabled?'':'disabled ')+'onclick="setAlarmProfile('+JSON.stringify(cam.camera_id).replace(/"/g,'&quot;')+','+JSON.stringify(p).replace(/"/g,'&quot;')+')">'+(p==='realtime'?'Realtime':(p==='light'?'Light 2s':'Eco 6s'))+'</button>').join('')+'</div>'+
+        '<div class="profile-help">'+(activeMode==='alarm'?'Effettivo '+esc(cam.alarm_effective_sample_ms??'—')+' ms · Wi-Fi sleep '+(cam.alarm_wifi_sleep?'ON':'OFF'):'Disponibile solo in modalità Allarme')+'</div>':
+        '<span class="muted">Richiede CamNode 1.2+</span>';
       const actionParts=[];
       if(!capable)actionParts.push('<span class="warn">USB iniziale richiesto</span>');
       else if(current)actionParts.push('<span class="ok">Aggiornata</span>');
@@ -708,11 +757,28 @@ async function refreshFirmware(){
       const slotTransition=j&&j.state==='completed'&&j.source_partition&&cam.ota_partition&&j.source_partition!==cam.ota_partition?'<div class="ok">'+esc(j.source_partition)+' → '+esc(cam.ota_partition)+'</div>':'';
       const stateLabel=maintenance?'<span class="warn">RIAVVIO</span>':(!cam.online?'<span class="bad">OFFLINE</span>':(nodeState==='standby'?'<span class="ok">STANDBY</span>':(recovery?'<span class="bad">'+esc(nodeState.toUpperCase())+'</span>':(startup?'<span class="warn">'+esc(nodeState.toUpperCase())+'</span>':'<span class="ok">'+esc(nodeState.toUpperCase())+'</span>'))));
       const stateDetail=activeMode?'<div class="muted">'+esc(activeMode)+(cam.camera_driver_on?' · driver ON':' · driver OFF')+'</div>':'';
-      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+stateLabel+stateDetail+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
+      return '<tr><td><b>'+esc(cam.camera_id)+'</b></td><td>'+stateLabel+stateDetail+'</td><td>'+profileCell+'</td><td><b>'+esc(cam.firmware||'—')+'</b>'+changed+'</td><td>#'+esc(cam.boot_count??'—')+'<div class="muted">'+fmtDuration(cam.uptime_sec)+'</div></td><td>'+esc(cam.reset_reason||'—')+'</td><td>'+esc(cam.ota_partition||'—')+slotTransition+'</td><td>'+otaStateLabel(j)+err+'</td><td><div class="progress"><div style="width:'+p+'%"></div></div><div class="muted">'+p+'%</div></td><td>'+action+'</td></tr>';
     }).join('');
   }catch(e){
     document.getElementById('firmwareManifest').textContent='Errore lettura stato OTA.';
   }
+}
+
+async function setAlarmProfile(id,profile){
+  const box=document.getElementById('firmwareUploadResult');
+  if(box)box.textContent='Imposto profilo '+alarmProfileLabel(profile)+' su '+id+'...';
+  const r=await fetch('/api/camera/'+encodeURIComponent(id)+'/alarm-profile/'+encodeURIComponent(profile),{method:'POST'});
+  if(!r.ok){
+    const msg=await apiErrorText(r);
+    if(box)box.textContent='Errore profilo: '+msg;
+    else alert('Errore profilo: '+msg);
+    return;
+  }
+  const j=await r.json();
+  cfg.alarm_power_profile=j.alarm_power_profile||profile;
+  if(box)box.textContent='Profilo '+alarmProfileLabel(j.alarm_power_profile||profile)+' confermato da CamNode.';
+  await refreshFirmware();
+  setTimeout(refresh,250);
 }
 
 async function updateCamera(id){
