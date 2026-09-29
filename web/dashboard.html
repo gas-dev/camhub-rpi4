@@ -94,6 +94,32 @@ th{color:var(--muted);font-weight:600}
 .profile-help{font-size:11px;color:var(--muted);margin-top:5px}
 .kpi{font-size:24px;font-weight:800;letter-spacing:-.5px}
 @media(max-width:650px){.alarm-item{grid-template-columns:56px minmax(0,1fr)}.alarm-thumb,.alarm-icon{width:56px;height:46px}.alarm-item>button{grid-column:1/-1}}
+.alarm-toolbar{display:flex;align-items:end;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.alarm-toolbar>div{min-width:170px}
+.alarm-toolbar label{margin-top:0}
+.alarm-gallery-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.alarm-gallery-card{overflow:hidden;padding:0;cursor:pointer;position:relative;min-width:0}
+.alarm-gallery-card:hover{transform:translateY(-2px);border-color:rgba(104,184,255,.42)}
+.alarm-gallery-image{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#030507}
+.alarm-gallery-body{padding:13px 14px 14px}
+.alarm-gallery-time{font-size:18px;font-weight:800;letter-spacing:-.3px}
+.alarm-gallery-meta{margin-top:5px;font-size:12px;color:var(--muted);line-height:1.55}
+.alarm-gallery-badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+.badge{display:inline-flex;align-items:center;padding:4px 7px;border-radius:999px;font-size:11px;border:1px solid var(--border);background:rgba(255,255,255,.04)}
+.badge.video{color:#d8ccff;border-color:rgba(139,124,255,.34);background:rgba(139,124,255,.1)}
+.badge.alarm{color:#ffafb4;border-color:rgba(255,116,125,.32);background:rgba(255,116,125,.08)}
+.alarm-empty{grid-column:1/-1;padding:42px 20px;text-align:center;color:var(--muted);border:1px dashed var(--border);border-radius:18px}
+.modal-backdrop{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.82);backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;padding:24px}
+.modal-backdrop.open{display:flex}
+.alarm-modal{width:min(1180px,96vw);max-height:94vh;overflow:auto;background:#0c121b;border:1px solid rgba(133,158,188,.26);border-radius:20px;box-shadow:0 30px 80px rgba(0,0,0,.55)}
+.alarm-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(12,18,27,.96);backdrop-filter:blur(12px);z-index:2}
+.alarm-modal-main{padding:16px}
+.alarm-modal-media{width:100%;max-height:72vh;object-fit:contain;background:#030507;border-radius:14px;border:1px solid var(--border)}
+.alarm-modal-video{width:100%;max-height:72vh;background:#000;border-radius:14px;border:1px solid var(--border)}
+.alarm-modal-info{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px}
+.alarm-modal-nav{display:flex;gap:7px}
+@media(max-width:1050px){.alarm-gallery-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:650px){.alarm-gallery-grid{grid-template-columns:1fr}.modal-backdrop{padding:8px}.alarm-modal{width:100%;max-height:98vh;border-radius:14px}}
 @media(max-width:900px){
   .shell{display:block}
   .sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--border)}
@@ -114,6 +140,7 @@ th{color:var(--muted);font-weight:600}
     <div class="subbrand">Raspberry Pi + CamNode</div>
     <nav class="nav">
       <button data-page="overview" class="active">Panoramica</button>
+      <button data-page="alarms">Allarmi</button>
       <button data-page="media">Media</button>
       <button data-page="camera">Camera</button>
       <button data-page="cloud">Cloud</button>
@@ -176,7 +203,7 @@ th{color:var(--muted);font-weight:600}
         <div class="card full">
           <div class="card-head">
             <div><h2>Ultimi allarmi</h2><div class="muted" style="font-size:12px;margin-top:3px">Gli ultimi eventi rilevati, con foto/video e stato archivio.</div></div>
-            <button onclick="document.querySelector('[data-page=&quot;media&quot;]').click()">Vedi tutti</button>
+            <button onclick="document.querySelector('[data-page=&quot;alarms&quot;]').click()">Vedi tutti</button>
           </div>
           <div id="recentAlarms" class="alarm-feed"><div class="muted">Nessun allarme recente.</div></div>
         </div>
@@ -192,6 +219,41 @@ th{color:var(--muted);font-weight:600}
           <div class="muted" style="margin-bottom:8px"><span class="legend-dot" style="background:#2F80ED"></span>Automatico <span class="legend-dot" style="background:#27AE60"></span>Streaming/manuale <span class="legend-dot" style="background:#EB5757"></span>Allarme</div>
           <img id="latest" class="latest" alt="Nessuna immagine">
           <div id="latestInfo" class="muted" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-alarms" class="section">
+      <div class="pagehead">
+        <div>
+          <h1>Allarmi</h1>
+          <div class="muted">Ricerca visiva rapida: tutte le foto di una giornata, tre per riga. Premi una foto per ingrandirla e vedere il video associato.</div>
+        </div>
+        <div id="alarmGalleryCount" class="status-chip">0 foto</div>
+      </div>
+
+      <div class="card full">
+        <div class="alarm-toolbar">
+          <div>
+            <label>Giornata</label>
+            <input id="alarmGalleryDate" type="date" onchange="refreshAlarmGallery()">
+          </div>
+          <div>
+            <label>Telecamera</label>
+            <select id="alarmGalleryCamera" onchange="refreshAlarmGallery()">
+              <option value="">Tutte le camere</option>
+            </select>
+          </div>
+          <div class="actions" style="margin-top:0">
+            <button onclick="moveAlarmDay(-1)">← Giorno prima</button>
+            <button class="primary" onclick="alarmToday()">Oggi</button>
+            <button onclick="moveAlarmDay(1)">Giorno dopo →</button>
+            <button onclick="refreshAlarmGallery()">Aggiorna</button>
+          </div>
+        </div>
+        <div id="alarmGalleryStatus" class="muted" style="margin-bottom:12px"></div>
+        <div id="alarmGalleryGrid" class="alarm-gallery-grid">
+          <div class="alarm-empty">Apri la pagina per caricare gli allarmi.</div>
         </div>
       </div>
     </section>
@@ -328,6 +390,33 @@ th{color:var(--muted);font-weight:600}
   </main>
 </div>
 
+<div id="alarmModalBackdrop" class="modal-backdrop" onclick="if(event.target===this)closeAlarmModal()">
+  <div class="alarm-modal">
+    <div class="alarm-modal-head">
+      <div>
+        <b id="alarmModalTitle">Allarme</b>
+        <div id="alarmModalSubtitle" class="muted" style="font-size:12px;margin-top:2px"></div>
+      </div>
+      <div class="alarm-modal-nav">
+        <button onclick="stepAlarmModal(-1)">←</button>
+        <button onclick="stepAlarmModal(1)">→</button>
+        <button onclick="closeAlarmModal()">Chiudi</button>
+      </div>
+    </div>
+    <div class="alarm-modal-main">
+      <img id="alarmModalImage" class="alarm-modal-media" alt="Foto allarme">
+      <video id="alarmModalVideo" class="alarm-modal-video" controls playsinline style="display:none"></video>
+      <div class="alarm-modal-info">
+        <div id="alarmModalInfo" class="muted"></div>
+        <div class="actions" style="margin-top:0">
+          <button id="alarmShowPhoto" onclick="showAlarmPhoto()" style="display:none">Vedi foto</button>
+          <button id="alarmShowVideo" class="primary" onclick="showAlarmVideo()" style="display:none">Riproduci video</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 let cfg={};
 let recentMedia=[];
@@ -335,6 +424,8 @@ let nodeCache=null;
 let googlePoll=null;
 let activePage='overview';
 let quickVideoInitialized=false;
+let alarmGalleryItems=[];
+let alarmModalIndex=-1;
 
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
@@ -372,6 +463,138 @@ function renderRecentAlarms(items){
       '<button onclick="window.open(\'/data/'+encodeURI(primary.relative)+'\',\'_blank\')">Apri</button></div>';
   }).join('');
 }
+
+function localIsoDate(d){
+  const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');
+  return y+'-'+m+'-'+day;
+}
+function alarmToday(){
+  document.getElementById('alarmGalleryDate').value=localIsoDate(new Date());
+  refreshAlarmGallery();
+}
+function moveAlarmDay(delta){
+  const input=document.getElementById('alarmGalleryDate');
+  const base=input.value?new Date(input.value+'T12:00:00'):new Date();
+  base.setDate(base.getDate()+Number(delta||0));
+  input.value=localIsoDate(base);
+  refreshAlarmGallery();
+}
+function alarmClock(v){
+  try{
+    const d=new Date(v);
+    return d.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }catch(e){return '—'}
+}
+function renderAlarmGallery(data){
+  alarmGalleryItems=data.photos||[];
+  const grid=document.getElementById('alarmGalleryGrid');
+  document.getElementById('alarmGalleryCount').textContent=alarmGalleryItems.length+' foto';
+  document.getElementById('alarmGalleryStatus').innerHTML=
+    '<b>'+esc(data.date||'')+'</b> · '+alarmGalleryItems.length+' foto allarme'+
+    (data.video_count?' · '+Number(data.video_count)+' video':'');
+  if(!alarmGalleryItems.length){
+    grid.innerHTML='<div class="alarm-empty">Nessuna foto di allarme in questa giornata.</div>';
+    return;
+  }
+  grid.innerHTML=alarmGalleryItems.map((x,i)=>{
+    const profile=x.alarm_power_profile?alarmProfileLabel(x.alarm_power_profile):'Profilo non registrato';
+    const cloud=x.cloud_status==='SYNCED'?'Drive sincronizzato':(x.cloud_status==='ERROR'?'Cloud errore':(x.cloud_status||'Locale'));
+    return '<div class="card alarm-gallery-card" onclick="openAlarmModal('+i+')">'+
+      '<img class="alarm-gallery-image" loading="lazy" src="'+esc(x.image_url)+'" alt="Foto allarme '+esc(x.camera_id||'')+'">'+
+      '<div class="alarm-gallery-body">'+
+        '<div class="alarm-gallery-time">'+esc(alarmClock(x.captured_at))+' · '+esc(x.camera_id||'CAM')+'</div>'+
+        '<div class="alarm-gallery-meta">'+esc(profile)+' · '+esc(cloud)+'<br>'+fmtBytes(x.size||0)+'</div>'+
+        '<div class="alarm-gallery-badges"><span class="badge alarm">ALLARME</span>'+
+          (x.video?'<span class="badge video">VIDEO DISPONIBILE</span>':'')+
+        '</div>'+
+      '</div></div>';
+  }).join('');
+}
+async function refreshAlarmGallery(){
+  const status=document.getElementById('alarmGalleryStatus');
+  const dateInput=document.getElementById('alarmGalleryDate');
+  const camSelect=document.getElementById('alarmGalleryCamera');
+  if(status)status.textContent='Ricerca allarmi...';
+  try{
+    const params=new URLSearchParams();
+    if(dateInput&&dateInput.value)params.set('date',dateInput.value);
+    if(camSelect&&camSelect.value)params.set('camera_id',camSelect.value);
+    const [data,nodes]=await Promise.all([
+      fetch('/api/alarms?'+params.toString()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}),
+      fetch('/api/nodes').then(r=>r.json()).catch(()=>[])
+    ]);
+    if(dateInput&&!dateInput.value)dateInput.value=data.date||'';
+    if(camSelect){
+      const selected=camSelect.value;
+      const ids=[...new Set((nodes||[]).map(n=>String(n.camera_id||'')).filter(Boolean))].sort();
+      camSelect.innerHTML='<option value="">Tutte le camere</option>'+ids.map(id=>'<option value="'+esc(id)+'">'+esc(id)+'</option>').join('');
+      if(ids.includes(selected))camSelect.value=selected;
+    }
+    renderAlarmGallery(data);
+  }catch(e){
+    document.getElementById('alarmGalleryGrid').innerHTML='<div class="alarm-empty bad">Errore nella ricerca degli allarmi.</div>';
+    if(status)status.textContent=String(e);
+  }
+}
+function openAlarmModal(index){
+  if(index<0||index>=alarmGalleryItems.length)return;
+  alarmModalIndex=index;
+  const x=alarmGalleryItems[index];
+  document.getElementById('alarmModalTitle').textContent=(x.camera_id||'CAM')+' · '+alarmClock(x.captured_at);
+  document.getElementById('alarmModalSubtitle').textContent=fmtEventTime(x.captured_at);
+  document.getElementById('alarmModalInfo').innerHTML=
+    '<b>'+esc(x.alarm_power_profile?alarmProfileLabel(x.alarm_power_profile):'Profilo non registrato')+'</b> · '+
+    esc(x.cloud_status||'')+' · '+fmtBytes(x.size||0)+
+    (x.video?' · video '+fmtDuration(x.video.encoded_duration_sec||x.video.requested_duration_sec||0):'');
+  document.getElementById('alarmModalImage').src=x.image_url;
+  const video=document.getElementById('alarmModalVideo');
+  video.pause();video.removeAttribute('src');video.load();video.style.display='none';
+  document.getElementById('alarmModalImage').style.display='block';
+  document.getElementById('alarmShowPhoto').style.display='none';
+  document.getElementById('alarmShowVideo').style.display=x.video?'inline-flex':'none';
+  document.getElementById('alarmModalBackdrop').classList.add('open');
+}
+function closeAlarmModal(){
+  const video=document.getElementById('alarmModalVideo');
+  video.pause();video.removeAttribute('src');video.load();
+  document.getElementById('alarmModalBackdrop').classList.remove('open');
+  alarmModalIndex=-1;
+}
+function showAlarmVideo(){
+  const x=alarmGalleryItems[alarmModalIndex];
+  if(!x||!x.video)return;
+  const image=document.getElementById('alarmModalImage');
+  const video=document.getElementById('alarmModalVideo');
+  image.style.display='none';
+  video.src=x.video.video_url;
+  video.style.display='block';
+  document.getElementById('alarmShowVideo').style.display='none';
+  document.getElementById('alarmShowPhoto').style.display='inline-flex';
+  video.play().catch(()=>{});
+}
+function showAlarmPhoto(){
+  const video=document.getElementById('alarmModalVideo');
+  video.pause();video.style.display='none';
+  document.getElementById('alarmModalImage').style.display='block';
+  document.getElementById('alarmShowPhoto').style.display='none';
+  const x=alarmGalleryItems[alarmModalIndex];
+  document.getElementById('alarmShowVideo').style.display=x&&x.video?'inline-flex':'none';
+}
+function stepAlarmModal(delta){
+  if(!alarmGalleryItems.length)return;
+  let next=alarmModalIndex+Number(delta||0);
+  if(next<0)next=alarmGalleryItems.length-1;
+  if(next>=alarmGalleryItems.length)next=0;
+  openAlarmModal(next);
+}
+document.addEventListener('keydown',e=>{
+  const open=document.getElementById('alarmModalBackdrop')?.classList.contains('open');
+  if(!open)return;
+  if(e.key==='Escape')closeAlarmModal();
+  if(e.key==='ArrowLeft')stepAlarmModal(-1);
+  if(e.key==='ArrowRight')stepAlarmModal(1);
+});
+
 function apiErrorText(r){return r.json().then(j=>j.detail||j.error||JSON.stringify(j)).catch(()=>r.text()).catch(()=>'Errore HTTP '+r.status)}
 
 document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',()=>{
@@ -379,6 +602,7 @@ document.querySelectorAll('.nav button').forEach(b=>b.addEventListener('click',(
   document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x===b));
   document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id==='page-'+activePage));
   if(activePage==='firmware')refreshFirmware();
+  if(activePage==='alarms')refreshAlarmGallery();
 }));
 
 function setModeButtons(mode){
@@ -797,6 +1021,7 @@ async function rebootCamera(id){
   await refreshFirmware();
 }
 
+document.getElementById('alarmGalleryDate').value=localIsoDate(new Date());
 refresh();
 refreshFirmware();
 setInterval(refresh,5000);
