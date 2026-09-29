@@ -196,7 +196,7 @@ th{color:var(--muted);font-weight:600}
           <div id="serverInfo" class="statusline muted">Caricamento...</div>
           <div class="actions">
             <button onclick="syncPending()">Sincronizza Drive</button>
-            <button onclick="cleanupOld()">Pulizia retention</button>
+            <button onclick="cleanupOld()">Libera SD in sicurezza</button>
           </div>
         </div>
 
@@ -335,7 +335,7 @@ th{color:var(--muted);font-weight:600}
     </section>
 
     <section id="page-cloud" class="section">
-      <div class="pagehead"><div><h1>Cloud</h1><div class="muted">Google Drive e sincronizzazione archivio</div></div></div>
+      <div class="pagehead"><div><h1>Cloud</h1><div class="muted">Google Drive, sincronizzazione e gestione sicura dello spazio locale</div></div></div>
       <div class="grid">
         <div class="card">
           <h2>Google Drive</h2>
@@ -351,9 +351,21 @@ th{color:var(--muted);font-weight:600}
           <label>Attesa batch, secondi</label><input id="cloud_batch_delay_sec" type="number" min="0" max="60">
           <label>Pausa su rate limit, secondi</label><input id="cloud_rate_limit_backoff_sec" type="number" min="60" max="86400">
           <label>Limite richieste rclone/sec</label><input id="cloud_tps_limit" type="number" min="1" max="100">
-          <label>Retention locale, giorni</label><input id="retention_days" type="number" min="1">
           <div class="actions"><button class="primary" onclick="saveConfig()">Salva impostazioni</button><button onclick="syncPending()">Sincronizza ora</button></div>
           <div id="cloudResult" class="muted" style="margin-top:10px"></div>
+        </div>
+
+        <div class="card full">
+          <h2>Libera scheda SD</h2>
+          <div class="notice muted">
+            CamHub conserva localmente il periodo scelto e considera eliminabili solo i file più vecchi.
+            Prima della cancellazione confronta la copia locale con Google Drive tramite checksum.
+            Se il file cloud manca o non coincide, CamHub lo carica nuovamente e lo verifica.
+            Se la verifica del file o del relativo manifest non riesce, la copia locale resta sulla SD.
+          </div>
+          <label>Conserva localmente gli ultimi giorni</label><input id="retention_days" type="number" min="1" max="3650">
+          <div class="actions"><button class="danger" onclick="cleanupOld()">Verifica cloud e libera SD</button></div>
+          <div id="cleanupResult" class="muted" style="margin-top:10px"></div>
         </div>
       </div>
     </section>
@@ -902,9 +914,43 @@ async function syncPending(){
 }
 
 async function cleanupOld(){
-  const r=await fetch('/api/maintenance/cleanup',{method:'POST'});
+  const days=Math.max(1,parseInt(document.getElementById('retention_days').value||cfg.retention_days||7));
+  const message='CamHub controllerà sul cloud tutti i file più vecchi di '+days+' giorni. Solo le copie verificate verranno eliminate dalla SD. Continuare?';
+  if(!window.confirm(message))return;
+
+  const cleanupBox=document.getElementById('cleanupResult');
+  const cloudBox=document.getElementById('cloudResult');
+  const actionBox=document.getElementById('actionResult');
+  const working='Verifica cloud in corso. I file non verificati resteranno sulla SD.';
+  if(cleanupBox)cleanupBox.textContent=working;
+  if(cloudBox)cloudBox.textContent=working;
+  if(actionBox)actionBox.textContent=working;
+
+  const r=await fetch('/api/cloud/cleanup?days='+encodeURIComponent(days),{method:'POST'});
+  if(!r.ok){
+    const error='Pulizia non eseguita: '+await apiErrorText(r);
+    if(cleanupBox)cleanupBox.textContent=error;
+    if(cloudBox)cloudBox.textContent=error;
+    if(actionBox)actionBox.textContent=error;
+    return;
+  }
+
   const j=await r.json();
-  document.getElementById('actionResult').textContent='Rimossi '+j.deleted+' file oltre retention.';
+  const summary=
+    'Candidati: '+Number(j.candidates||0)+
+    ' · già verificati sul cloud: '+Number(j.verified_existing||0)+
+    ' · caricati/ripristinati e verificati: '+Number(j.uploaded_verified||0)+
+    ' · rimossi dalla SD: '+Number(j.deleted||0)+
+    ' · mantenuti per sicurezza: '+Number(j.kept||0)+
+    ' · spazio liberato: '+fmtBytes(j.freed_bytes||0);
+  const problems=(j.failures||[]);
+  const detail=problems.length
+    ? ' · '+problems.length+' file non eliminati perché non verificati o non cancellabili.'
+    : ' · Tutte le eliminazioni richieste sono state verificate.';
+
+  if(cleanupBox)cleanupBox.textContent=summary+detail;
+  if(cloudBox)cloudBox.textContent=summary+detail;
+  if(actionBox)actionBox.textContent=summary+detail;
   setTimeout(refresh,500);
 }
 

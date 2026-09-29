@@ -146,6 +146,27 @@ Default cloud protection:
 
 These values can be changed from the dashboard.
 
+## Safe local retention and SD cleanup
+
+CamHub 2.4.0 adds cloud-verified local cleanup. The retention period can be selected from the Cloud page.
+
+The cleanup path is intentionally conservative:
+
+- media older than the selected local retention period is checked against Google Drive before deletion
+- verification uses rclone check, which compares file size and a common checksum when the backend supports it
+- a file missing from Drive, different from the local copy, unreadable or not explicitly reported as identical is never deleted locally
+- missing or different media is uploaded again with checksum comparison and then checked a second time
+- the JSON manifest is synchronized and verified as well
+- only after both media and manifest are verified does CamHub delete the local copies
+- any cloud, authentication, checksum or deletion error leaves the local media on the SD
+- the previous /api/maintenance/cleanup endpoint now uses this same safe cloud-first workflow, so the Overview shortcut cannot bypass cloud verification
+
+The API endpoint is:
+
+    POST /api/cloud/cleanup?days=7
+
+The response reports candidate files, cloud copies already verified, files uploaded and re-verified, local files deleted, files kept for safety and bytes freed.
+
 ## Cloud health test
 
 The dashboard includes Test Google Drive.

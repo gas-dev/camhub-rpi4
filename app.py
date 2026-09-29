@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="2.3.3")
+app = FastAPI(title="CamHub", version="2.4.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -2502,7 +2502,11 @@ def alarm_gallery_for_day(
     }
 
 
-def _rclone_batch(files: list[Path], cfg: dict[str, Any]) -> tuple[bool, str]:
+def _rclone_batch(
+    files: list[Path],
+    cfg: dict[str, Any],
+    checksum: bool = False,
+) -> tuple[bool, str]:
     if not files:
         return True, ""
     target = f"{cfg['drive_remote']}:{cfg['drive_root'].strip('/')}"
@@ -2511,16 +2515,19 @@ def _rclone_batch(files: list[Path], cfg: dict[str, Any]) -> tuple[bool, str]:
         for path in files:
             temp.write(path.relative_to(DATA_DIR).as_posix() + "\n")
     try:
+        command = [
+            "rclone", "copy", str(DATA_DIR), target,
+            "--files-from", str(temp_path),
+            "--transfers", "2", "--checkers", "2",
+            "--retries", "3", "--low-level-retries", "5",
+            "--no-traverse",
+            "--tpslimit", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+            "--tpslimit-burst", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+        ]
+        if checksum:
+            command.append("--checksum")
         result = subprocess.run(
-            [
-                "rclone", "copy", str(DATA_DIR), target,
-                "--files-from", str(temp_path),
-                "--transfers", "2", "--checkers", "2",
-                "--retries", "3", "--low-level-retries", "5",
-                "--no-traverse",
-                "--tpslimit", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
-                "--tpslimit-burst", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
-            ],
+            command,
             capture_output=True, text=True, timeout=900,
         )
         return result.returncode == 0, (result.stderr or result.stdout)[-3000:]
@@ -2531,6 +2538,365 @@ def _rclone_batch(files: list[Path], cfg: dict[str, Any]) -> tuple[bool, str]:
             temp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _rclone_check_batch(
+    files: list[Path],
+    cfg: dict[str, Any],
+) -> tuple[set[str], dict[str, str], str]:
+    """
+    Verify local files against the cloud copy.
+
+    Only paths reported by rclone with "=" are trusted as identical. Any
+    missing, different, unreadable or unreported path is treated as unsafe and
+    must never be deleted locally.
+    """
+    requested: list[str] = []
+    for path in files:
+        try:
+            requested.append(path.relative_to(DATA_DIR).as_posix())
+        except ValueError:
+            continue
+
+    if not requested:
+        return set(), {}, ""
+
+    target = f"{cfg['drive_remote']}:{cfg['drive_root'].strip('/')}"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as temp:
+        files_path = Path(temp.name)
+        for relative in requested:
+            temp.write(relative + "\n")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as report:
+        report_path = Path(report.name)
+
+    try:
+        result = subprocess.run(
+            [
+                "rclone", "check", str(DATA_DIR), target,
+                "--files-from", str(files_path),
+                "--one-way",
+                "--combined", str(report_path),
+                "--checkers", "2",
+                "--tpslimit", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+                "--tpslimit-burst", str(max(1, int(cfg.get("cloud_tps_limit", 8)))),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+
+        statuses: dict[str, str] = {}
+        try:
+            for raw_line in report_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines():
+                if len(raw_line) >= 3 and raw_line[1] == " ":
+                    statuses[raw_line[2:].strip()] = raw_line[0]
+        except Exception:
+            pass
+
+        # Missing report rows are never trusted.
+        for relative in requested:
+            statuses.setdefault(relative, "!")
+
+        matched = {
+            relative
+            for relative, status in statuses.items()
+            if status == "="
+        }
+        detail = ((result.stderr or "") or (result.stdout or ""))[-4000:]
+        return matched, statuses, detail
+    except Exception as exc:
+        return set(), {relative: "!" for relative in requested}, str(exc)
+    finally:
+        for temp_path in (files_path, report_path):
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _media_time_for_cleanup(path: Path) -> datetime:
+    meta = read_metadata(path)
+    local_tz = now_local().tzinfo
+    for key in ("captured_at", "received_at"):
+        raw = meta.get(key)
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00")
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=local_tz)
+            return parsed.astimezone(local_tz)
+        except Exception:
+            pass
+    return datetime.fromtimestamp(
+        path.stat().st_mtime,
+        tz=local_tz,
+    )
+
+
+def _existing_metadata_path(media_path: Path) -> Path | None:
+    current = (
+        media_path.parent
+        / "manifest"
+        / f"{media_path.stem}.json"
+    )
+    if current.exists():
+        return current
+    legacy = legacy_metadata_path(media_path)
+    if legacy.exists():
+        return legacy
+    return None
+
+
+def _prune_empty_data_dirs() -> None:
+    directories = sorted(
+        (path for path in DATA_DIR.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+        except Exception:
+            pass
+
+
+def safe_cloud_cleanup(
+    cutoff: datetime,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Free local storage without ever deleting the only verified media copy.
+
+    Workflow:
+      1. select media older than cutoff;
+      2. compare local media with Drive using rclone check (size + hash);
+      3. upload missing/different media with checksum comparison;
+      4. verify the media again;
+      5. sync and verify its manifest;
+      6. delete local media + manifest only after both remote checks match.
+    """
+    candidates = sorted(
+        (
+            path
+            for path in media_files()
+            if _media_time_for_cleanup(path) < cutoff
+        ),
+        key=_media_time_for_cleanup,
+    )
+
+    result: dict[str, Any] = {
+        "cutoff": cutoff.isoformat(),
+        "candidates": len(candidates),
+        "verified_existing": 0,
+        "uploaded_verified": 0,
+        "deleted": 0,
+        "kept": len(candidates),
+        "freed_bytes": 0,
+        "failures": [],
+    }
+    if not candidates:
+        return result
+
+    failures: list[dict[str, str]] = []
+    now_synced = now_local().isoformat()
+
+    with cloud_lock:
+        matched, statuses, check_detail = _rclone_check_batch(
+            candidates,
+            cfg,
+        )
+        initial_verified = {
+            path
+            for path in candidates
+            if path.relative_to(DATA_DIR).as_posix() in matched
+        }
+        result["verified_existing"] = len(initial_verified)
+
+        needs_upload = [
+            path
+            for path in candidates
+            if path not in initial_verified
+        ]
+
+        verified_media = set(initial_verified)
+        if needs_upload:
+            upload_ok, upload_detail = _rclone_batch(
+                needs_upload,
+                cfg,
+                checksum=True,
+            )
+            matched_after, statuses_after, recheck_detail = (
+                _rclone_check_batch(needs_upload, cfg)
+            )
+            newly_verified = {
+                path
+                for path in needs_upload
+                if path.relative_to(DATA_DIR).as_posix()
+                in matched_after
+            }
+            verified_media.update(newly_verified)
+            result["uploaded_verified"] = len(newly_verified)
+
+            if not upload_ok:
+                record_runtime_error(
+                    "cloud_cleanup",
+                    upload_detail or "Safe cleanup upload returned an error.",
+                )
+
+            for path in needs_upload:
+                if path in newly_verified:
+                    continue
+                relative = path.relative_to(DATA_DIR).as_posix()
+                status = statuses_after.get(
+                    relative,
+                    statuses.get(relative, "!"),
+                )
+                failures.append({
+                    "file": relative,
+                    "stage": "media",
+                    "reason": (
+                        "Cloud copy could not be verified "
+                        f"(rclone status {status})."
+                    ),
+                })
+                if _existing_metadata_path(path) is not None:
+                    update_metadata(
+                        path,
+                        cloud_status="ERROR",
+                        cloud_error=(
+                            recheck_detail
+                            or upload_detail
+                            or check_detail
+                            or "Cloud verification failed during safe cleanup."
+                        )[-3000:],
+                        cloud_error_at=now_synced,
+                    )
+
+        manifest_files: list[Path] = []
+        media_for_manifest: dict[str, Path] = {}
+
+        for path in verified_media:
+            if _existing_metadata_path(path) is None:
+                relative = path.relative_to(DATA_DIR).as_posix()
+                failures.append({
+                    "file": relative,
+                    "stage": "manifest",
+                    "reason": (
+                        "Local manifest is missing. Media was kept locally."
+                    ),
+                })
+                continue
+
+            update_metadata(
+                path,
+                cloud_status="SYNCED",
+                cloud_synced_at=now_synced,
+                cloud_error=None,
+                cloud_error_at=None,
+            )
+            manifest = metadata_path(path)
+            manifest_files.append(manifest)
+            media_for_manifest[
+                manifest.relative_to(DATA_DIR).as_posix()
+            ] = path
+
+        manifest_matched: set[str] = set()
+        manifest_detail = ""
+        if manifest_files:
+            manifest_upload_ok, manifest_upload_detail = _rclone_batch(
+                manifest_files,
+                cfg,
+                checksum=True,
+            )
+            manifest_matched, _, manifest_detail = _rclone_check_batch(
+                manifest_files,
+                cfg,
+            )
+            if not manifest_upload_ok:
+                record_runtime_error(
+                    "cloud_cleanup_manifest",
+                    manifest_upload_detail
+                    or "Safe cleanup manifest upload returned an error.",
+                )
+
+        deletable: list[Path] = []
+        for manifest_relative, media_path in media_for_manifest.items():
+            if manifest_relative in manifest_matched:
+                deletable.append(media_path)
+                continue
+
+            relative = media_path.relative_to(DATA_DIR).as_posix()
+            failures.append({
+                "file": relative,
+                "stage": "manifest",
+                "reason": (
+                    "Cloud manifest could not be verified. "
+                    "Media was kept locally."
+                ),
+            })
+            update_metadata(
+                media_path,
+                cloud_status="ERROR",
+                cloud_error=(
+                    manifest_detail
+                    or "Cloud manifest verification failed during safe cleanup."
+                )[-3000:],
+                cloud_error_at=now_local().isoformat(),
+            )
+
+        freed_bytes = 0
+        deleted = 0
+        for path in deletable:
+            try:
+                if path.exists():
+                    freed_bytes += path.stat().st_size
+                current_meta = metadata_path(path)
+                legacy_meta = legacy_metadata_path(path)
+                if current_meta.exists():
+                    freed_bytes += current_meta.stat().st_size
+                if (
+                    legacy_meta.exists()
+                    and legacy_meta != current_meta
+                ):
+                    freed_bytes += legacy_meta.stat().st_size
+
+                current_meta.unlink(missing_ok=True)
+                legacy_meta.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except Exception as exc:
+                failures.append({
+                    "file": path.relative_to(DATA_DIR).as_posix(),
+                    "stage": "delete",
+                    "reason": str(exc),
+                })
+
+        _prune_empty_data_dirs()
+
+    result["deleted"] = deleted
+    result["kept"] = len(candidates) - deleted
+    result["freed_bytes"] = freed_bytes
+    result["failures"] = failures[:100]
+
+    if failures:
+        record_runtime_error(
+            "cloud_cleanup",
+            (
+                f"Safe cleanup kept {len(candidates) - deleted} of "
+                f"{len(candidates)} candidate files. "
+                f"{len(failures)} verification/deletion issue(s)."
+            ),
+        )
+
+    return result
 
 
 def sync_pending_batch() -> int:
@@ -5267,19 +5633,42 @@ def disconnect_google_oauth():
     return {"ok": True, "message": "Google Drive disconnected from CamHub."}
 
 
-@app.post("/api/maintenance/cleanup")
-def cleanup_retention():
+@app.post("/api/cloud/cleanup")
+def cloud_cleanup(days: int | None = None):
     cfg = load_config()
-    cutoff = now_local() - timedelta(days=max(1, int(cfg.get("retention_days", 7))))
-    deleted = 0
-    for path in media_files():
-        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=now_local().tzinfo)
-        if modified < cutoff:
-            metadata_path(path).unlink(missing_ok=True)
-            legacy_metadata_path(path).unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
-            deleted += 1
-    return {"deleted": deleted, "cutoff": cutoff.isoformat()}
+    if not cfg.get("drive_enabled"):
+        raise HTTPException(
+            400,
+            "Google Drive sync must be enabled before local files can be removed.",
+        )
+    if shutil.which("rclone") is None:
+        raise HTTPException(
+            503,
+            "rclone is not available. No local file was deleted.",
+        )
+
+    retention_days = max(
+        1,
+        min(
+            3650,
+            int(
+                days
+                if days is not None
+                else cfg.get("retention_days", 7)
+            ),
+        ),
+    )
+    cutoff = now_local() - timedelta(days=retention_days)
+    cleanup = safe_cloud_cleanup(cutoff, cfg)
+    cleanup["retention_days"] = retention_days
+    return cleanup
+
+
+@app.post("/api/maintenance/cleanup")
+def cleanup_retention(days: int | None = None):
+    # Backward-compatible endpoint used by the Overview page. It now uses the
+    # same verified cloud-first deletion path as the Cloud page.
+    return cloud_cleanup(days)
 
 
 @app.get("/data/{file_path:path}")
