@@ -38,7 +38,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="2.2.0")
+app = FastAPI(title="CamHub", version="2.3.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -2302,6 +2302,204 @@ def recent_items(limit: int = 50) -> list[dict[str, Any]]:
             "error_category": meta.get("error_category"),
         })
     return items
+
+
+
+def alarm_gallery_for_day(
+    day_text: str,
+    camera_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        target_day = datetime.strptime(
+            day_text,
+            "%Y-%m-%d",
+        ).date()
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            "date must be YYYY-MM-DD",
+        ) from exc
+
+    wanted_camera = str(camera_id or "").strip()
+    media: list[dict[str, Any]] = []
+
+    camera_dirs = [
+        path
+        for path in DATA_DIR.iterdir()
+        if path.is_dir()
+    ] if DATA_DIR.exists() else []
+
+    for camera_dir in camera_dirs:
+        if (
+            wanted_camera
+            and camera_dir.name != wanted_camera
+        ):
+            continue
+
+        day_dir = (
+            camera_dir
+            / target_day.strftime("%Y")
+            / target_day.strftime("%m")
+            / target_day.strftime("%d")
+        )
+
+        if not day_dir.exists():
+            continue
+
+        for path in day_dir.iterdir():
+            if (
+                not path.is_file()
+                or path.suffix.lower()
+                not in {".jpg", ".jpeg", ".mp4"}
+            ):
+                continue
+
+            meta = read_metadata(path)
+            event_type = str(
+                meta.get("event_type")
+                or ""
+            ).lower()
+
+            if not event_type.startswith("alarm"):
+                continue
+
+            captured_at = (
+                meta.get("captured_at")
+                or datetime.fromtimestamp(
+                    path.stat().st_mtime,
+                    tz=now_local().tzinfo,
+                ).isoformat()
+            )
+
+            media_type = meta.get(
+                "media_type",
+                (
+                    "video"
+                    if path.suffix.lower() == ".mp4"
+                    else "image"
+                ),
+            )
+
+            media.append({
+                "file": path.name,
+                "relative": path.relative_to(
+                    DATA_DIR
+                ).as_posix(),
+                "camera_id": (
+                    meta.get("camera_id")
+                    or camera_dir.name
+                ),
+                "event_type": meta.get(
+                    "event_type"
+                ),
+                "captured_at": captured_at,
+                "cloud_status": meta.get(
+                    "cloud_status",
+                    "PENDING",
+                ),
+                "size": path.stat().st_size,
+                "sha256": meta.get("sha256"),
+                "media_type": media_type,
+                "source": meta.get("source"),
+                "alarm_power_profile": meta.get(
+                    "alarm_power_profile"
+                ),
+                "requested_duration_sec": meta.get(
+                    "requested_duration_sec"
+                ),
+                "encoded_duration_sec": meta.get(
+                    "encoded_duration_sec"
+                ),
+            })
+
+    def item_epoch(item: dict[str, Any]) -> float:
+        try:
+            return datetime.fromisoformat(
+                str(item.get("captured_at") or "")
+            ).timestamp()
+        except Exception:
+            return 0.0
+
+    media.sort(
+        key=item_epoch,
+        reverse=True,
+    )
+
+    videos = [
+        item
+        for item in media
+        if item.get("media_type") == "video"
+    ]
+
+    photos: list[dict[str, Any]] = []
+
+    for item in media:
+        if item.get("media_type") != "image":
+            continue
+
+        image_time = item_epoch(item)
+        nearest_video: dict[str, Any] | None = None
+        nearest_delta: float | None = None
+
+        for video in videos:
+            if (
+                str(video.get("camera_id") or "")
+                != str(item.get("camera_id") or "")
+            ):
+                continue
+
+            delta = abs(
+                item_epoch(video) - image_time
+            )
+
+            # Alarm still and alarm video are created by the same trigger.
+            # A generous 45-second association window covers startup and
+            # encoding latency without merging unrelated events in normal use.
+            if delta > 45.0:
+                continue
+
+            if (
+                nearest_delta is None
+                or delta < nearest_delta
+            ):
+                nearest_video = video
+                nearest_delta = delta
+
+        row = dict(item)
+        row["image_url"] = (
+            "/data/"
+            + item["relative"]
+        )
+        row["video"] = (
+            {
+                **nearest_video,
+                "video_url": (
+                    "/data/"
+                    + str(
+                        nearest_video["relative"]
+                    )
+                ),
+            }
+            if nearest_video
+            else None
+        )
+
+        photos.append(row)
+
+    cameras = sorted({
+        str(item.get("camera_id") or "")
+        for item in media
+        if item.get("camera_id")
+    })
+
+    return {
+        "date": target_day.isoformat(),
+        "camera_id": wanted_camera or None,
+        "count": len(photos),
+        "video_count": len(videos),
+        "cameras": cameras,
+        "photos": photos,
+    }
 
 
 def _rclone_batch(files: list[Path], cfg: dict[str, Any]) -> tuple[bool, str]:
@@ -4829,6 +5027,22 @@ def live_proxy(camera_id: str):
 @app.get("/api/recent")
 def api_recent(limit: int = 50):
     return recent_items(max(1, min(limit, 200)))
+
+
+@app.get("/api/alarms")
+def api_alarm_gallery(
+    date: str | None = None,
+    camera_id: str | None = None,
+):
+    selected_day = (
+        date
+        or now_local().date().isoformat()
+    )
+
+    return alarm_gallery_for_day(
+        selected_day,
+        camera_id,
+    )
 
 
 @app.get("/api/errors")
