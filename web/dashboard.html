@@ -73,6 +73,12 @@ th,td{padding:9px 8px;text-align:left;border-bottom:1px solid var(--border);vert
 th{color:var(--muted);font-weight:600}
 .scroll{overflow:auto}
 .mono{font-family:Consolas,monospace;word-break:break-all}
+.cleanup-console{margin-top:12px;max-height:360px;overflow:auto;background:#05080d;border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-family:Consolas,monospace;font-size:12px;line-height:1.55;white-space:pre-wrap}
+.cleanup-line{padding:2px 0;border-bottom:1px solid rgba(133,158,188,.06)}
+.cleanup-line:last-child{border-bottom:0}
+.cleanup-line.ok{color:var(--ok)}
+.cleanup-line.warning{color:var(--warn)}
+.cleanup-line.error{color:var(--bad)}
 .notice{padding:11px 12px;border:1px solid var(--border);border-radius:9px;background:#101722;margin:10px 0}.legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 5px 0 12px;vertical-align:middle;border:1px solid #111}.legend-dot:first-child{margin-left:0}
 .progress{height:8px;background:#0c1117;border-radius:99px;overflow:hidden;min-width:120px}
 .progress>div{height:100%;background:var(--accent);width:0}
@@ -358,14 +364,14 @@ th{color:var(--muted);font-weight:600}
         <div class="card full">
           <h2>Libera scheda SD</h2>
           <div class="notice muted">
-            CamHub conserva localmente il periodo scelto e considera eliminabili solo i file più vecchi.
-            Prima della cancellazione confronta la copia locale con Google Drive tramite checksum.
-            Se il file cloud manca o non coincide, CamHub lo carica nuovamente e lo verifica.
-            Se la verifica del file o del relativo manifest non riesce, la copia locale resta sulla SD.
+            CamHub considera eliminabili solo i file più vecchi del periodo scelto.
+            Ogni file viene prima controllato su Google Drive. Se manca o non coincide viene caricato e verificato di nuovo.
+            Il file locale viene eliminato soltanto dopo la verifica del media e del relativo manifest.
           </div>
-          <label>Conserva localmente gli ultimi giorni</label><input id="retention_days" type="number" min="1" max="3650">
-          <div class="actions"><button class="danger" onclick="cleanupOld()">Verifica cloud e libera SD</button></div>
-          <div id="cleanupResult" class="muted" style="margin-top:10px"></div>
+          <label>Elimina dalla SD i file più vecchi di, giorni</label><input id="retention_days" type="number" min="1" max="3650">
+          <div class="actions"><button id="cleanupButton" class="danger" onclick="cleanupOld()">Verifica cloud e libera SD</button></div>
+          <div id="cleanupResult" class="muted" style="margin-top:10px">Nessuna pulizia in esecuzione.</div>
+          <div id="cleanupReport" class="cleanup-console"><div class="cleanup-line muted">Il report dettagliato della pulizia apparirà qui.</div></div>
         </div>
       </div>
     </section>
@@ -443,13 +449,16 @@ let cfg={};
 let recentMedia=[];
 let nodeCache=null;
 let googlePoll=null;
+let cleanupPoll=null;
+let cleanupLastSeq=0;
+let cleanupJobId=0;
 let activePage='overview';
 let quickVideoInitialized=false;
 let alarmGalleryItems=[];
 let alarmModalIndex=-1;
 
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-function fmtBytes(n){n=Number(n||0);if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
+function fmtBytes(n){n=Number(n||0);if(n>=1099511627776)return(n/1099511627776).toFixed(2)+' TB';if(n>=1073741824)return(n/1073741824).toFixed(2)+' GB';if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B'}
 function fmtDuration(sec){sec=Math.max(0,Number(sec||0));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=Math.floor(sec%60);return(d?d+'g ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
 function alarmProfileLabel(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Standby Light · ~2 s':(p==='eco'?'Standby Eco · ~6 s':'Realtime')}
 function alarmProfileDetail(p){p=String(p||'realtime').toLowerCase();return p==='light'?'Wi-Fi sleep · controllo ordinario ogni ~2 s':(p==='eco'?'Wi-Fi sleep · controllo ordinario ogni ~6 s':'Rilevamento continuo secondo il campionamento configurato')}
@@ -819,9 +828,14 @@ async function refresh(){
     const bo=st.cloud_backoff||{};
     document.getElementById('serverInfo').innerHTML=
       'Server: <b>'+esc(st.server_name)+'</b><br>'+
-      'Media: '+st.media_count+' · '+st.data_mb+' MB<br>'+
+      'SD CamHub: <b>'+Number(st.local_media_count||0)+' media</b> · '+fmtBytes(st.local_media_bytes||0)+'<br>'+
+      'Archivio locale totale: '+Number(st.local_archive_files||0)+' file · '+fmtBytes(st.local_archive_bytes||0)+'<br>'+
+      'Scheda SD: '+fmtBytes(st.sd_used_bytes||0)+' usati / '+fmtBytes(st.sd_total_bytes||0)+' · liberi '+fmtBytes(st.sd_free_bytes||0)+'<br>'+
+      'Cloud registrati da CamHub: <b>'+Number(st.cloud_known_media_count||0)+' media</b> · '+fmtBytes(st.cloud_known_media_bytes||0)+
+      ' · verificati '+Number(st.cloud_verified_media_count||0)+'<br>'+
       'Drive: '+(st.drive_enabled?'<span class="ok">ATTIVO</span>':'DISATTIVO')+' · pendenti '+st.pending_cloud+
-      (bo.active?'<br><span class="warn">Pausa rate limit: '+bo.remaining_sec+' s</span>':'');
+      (bo.active?'<br><span class="warn">Pausa rate limit: '+bo.remaining_sec+' s</span>':'')+
+      '<br><span class="muted">Il conteggio cloud è il registro dei file inviati/verificati da CamHub, non una scansione completa di Drive.</span>';
     document.getElementById('systemInfo').innerHTML=document.getElementById('serverInfo').innerHTML+
       '<br>Rclone: '+(st.rclone_available?'OK':'NON TROVATO')+
       '<br>OAuth dedicato: '+(st.drive_custom_oauth?'SI':'NO');
@@ -913,45 +927,100 @@ async function syncPending(){
   document.getElementById('cloudResult').textContent=t;
 }
 
+function appendCleanupLogs(logs){
+  const report=document.getElementById('cleanupReport');
+  if(!report)return;
+  (logs||[]).forEach(row=>{
+    const div=document.createElement('div');
+    const level=String(row.level||'info');
+    div.className='cleanup-line '+(level==='ok'?'ok':(level==='warning'?'warning':(level==='error'?'error':'')));
+    let clock='';
+    try{clock=new Date(row.time).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}catch(e){}
+    div.textContent=(clock?clock+' · ':'')+String(row.message||'');
+    report.appendChild(div);
+    cleanupLastSeq=Math.max(cleanupLastSeq,Number(row.seq||0));
+  });
+  if((logs||[]).length)report.scrollTop=report.scrollHeight;
+}
+
+function cleanupSummary(result){
+  if(!result)return '';
+  return 'Totale SD analizzati: '+Number(result.total_local_files||0)+
+    ' · candidati: '+Number(result.candidates||0)+
+    ' · troppo recenti: '+Number(result.too_recent||0)+
+    ' · già verificati: '+Number(result.verified_existing||0)+
+    ' · caricati e verificati: '+Number(result.uploaded_verified||0)+
+    ' · cancellati: '+Number(result.deleted||0)+
+    ' · mantenuti: '+Number(result.kept||0)+
+    ' · spazio liberato: '+fmtBytes(result.freed_bytes||0);
+}
+
+function ensureCleanupPolling(){
+  if(cleanupPoll)return;
+  cleanupPoll=setInterval(pollCleanupStatus,700);
+}
+
+async function pollCleanupStatus(){
+  try{
+    const r=await fetch('/api/cloud/cleanup/status?after_seq='+encodeURIComponent(cleanupLastSeq));
+    if(!r.ok)return;
+    const j=await r.json();
+    if(j.job_id)cleanupJobId=Number(j.job_id||0);
+    appendCleanupLogs(j.logs||[]);
+
+    const button=document.getElementById('cleanupButton');
+    if(button)button.disabled=!!j.running;
+
+    const box=document.getElementById('cleanupResult');
+    if(j.running){
+      if(box)box.textContent='Pulizia #'+j.job_id+' in corso · cutoff '+(j.cutoff||'calcolo...');
+      ensureCleanupPolling();
+      return;
+    }
+
+    if(j.status==='completed'&&j.result){
+      const text=cleanupSummary(j.result);
+      if(box)box.textContent=text;
+      const actionBox=document.getElementById('actionResult');
+      if(actionBox)actionBox.textContent=text;
+      if(cleanupPoll){clearInterval(cleanupPoll);cleanupPoll=null}
+      setTimeout(refresh,250);
+    }else if(j.status==='error'){
+      if(box)box.textContent='Pulizia terminata con errore: '+String(j.error||'errore non specificato');
+      if(cleanupPoll){clearInterval(cleanupPoll);cleanupPoll=null}
+    }else{
+      if(cleanupPoll){clearInterval(cleanupPoll);cleanupPoll=null}
+    }
+  }catch(e){}
+}
+
 async function cleanupOld(){
   const days=Math.max(1,parseInt(document.getElementById('retention_days').value||cfg.retention_days||7));
-  const message='CamHub controllerà sul cloud tutti i file più vecchi di '+days+' giorni. Solo le copie verificate verranno eliminate dalla SD. Continuare?';
+  const message='CamHub analizzerà tutti i file più vecchi di '+days+' giorno/i. Verranno cancellati dalla SD solo dopo verifica del media e del manifest sul cloud. Continuare?';
   if(!window.confirm(message))return;
 
-  const cleanupBox=document.getElementById('cleanupResult');
-  const cloudBox=document.getElementById('cloudResult');
-  const actionBox=document.getElementById('actionResult');
-  const working='Verifica cloud in corso. I file non verificati resteranno sulla SD.';
-  if(cleanupBox)cleanupBox.textContent=working;
-  if(cloudBox)cloudBox.textContent=working;
-  if(actionBox)actionBox.textContent=working;
+  const report=document.getElementById('cleanupReport');
+  if(report)report.innerHTML='';
+  cleanupLastSeq=0;
+  cleanupJobId=0;
+
+  const box=document.getElementById('cleanupResult');
+  if(box)box.textContent='Avvio pulizia sicura...';
 
   const r=await fetch('/api/cloud/cleanup?days='+encodeURIComponent(days),{method:'POST'});
   if(!r.ok){
-    const error='Pulizia non eseguita: '+await apiErrorText(r);
-    if(cleanupBox)cleanupBox.textContent=error;
-    if(cloudBox)cloudBox.textContent=error;
-    if(actionBox)actionBox.textContent=error;
+    const error='Pulizia non avviata: '+await apiErrorText(r);
+    if(box)box.textContent=error;
+    appendCleanupLogs([{seq:1,time:new Date().toISOString(),level:'error',message:error}]);
     return;
   }
 
   const j=await r.json();
-  const summary=
-    'Candidati: '+Number(j.candidates||0)+
-    ' · già verificati sul cloud: '+Number(j.verified_existing||0)+
-    ' · caricati/ripristinati e verificati: '+Number(j.uploaded_verified||0)+
-    ' · rimossi dalla SD: '+Number(j.deleted||0)+
-    ' · mantenuti per sicurezza: '+Number(j.kept||0)+
-    ' · spazio liberato: '+fmtBytes(j.freed_bytes||0);
-  const problems=(j.failures||[]);
-  const detail=problems.length
-    ? ' · '+problems.length+' file non eliminati perché non verificati o non cancellabili.'
-    : ' · Tutte le eliminazioni richieste sono state verificate.';
-
-  if(cleanupBox)cleanupBox.textContent=summary+detail;
-  if(cloudBox)cloudBox.textContent=summary+detail;
-  if(actionBox)actionBox.textContent=summary+detail;
-  setTimeout(refresh,500);
+  cleanupJobId=Number(j.job_id||0);
+  appendCleanupLogs(j.logs||[]);
+  if(box)box.textContent='Pulizia #'+cleanupJobId+' avviata.';
+  ensureCleanupPolling();
+  await pollCleanupStatus();
 }
 
 async function testDrive(){
@@ -1100,6 +1169,7 @@ document.getElementById('alarmGalleryDate').value=localIsoDate(new Date());
 initAlarmGalleryColumns();
 refresh();
 refreshFirmware();
+pollCleanupStatus();
 setInterval(refresh,5000);
 setInterval(refreshQueue,1000);
 setInterval(refreshFirmware,3000);
