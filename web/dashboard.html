@@ -98,7 +98,7 @@ th{color:var(--muted);font-weight:600}
 .alarm-toolbar>div{min-width:170px}
 .alarm-toolbar label{margin-top:0}
 .alarm-gallery-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
-.alarm-gallery-card{overflow:hidden;padding:0;cursor:pointer;position:relative;min-width:0}\n.alarm-gallery-grid>.alarm-gallery-card{grid-column:auto !important}
+.alarm-gallery-card{grid-column:auto;overflow:hidden;padding:0;cursor:pointer;position:relative;min-width:0;background:linear-gradient(145deg,var(--panel),rgba(13,19,28,.94));border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);backdrop-filter:blur(10px);transition:.18s ease}
 .alarm-gallery-card:hover{transform:translateY(-2px);border-color:rgba(104,184,255,.42)}
 .alarm-gallery-image{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#030507}
 .alarm-gallery-body{padding:13px 14px 14px}
@@ -528,7 +528,7 @@ function renderAlarmGallery(data){
   grid.innerHTML=alarmGalleryItems.map((x,i)=>{
     const profile=x.alarm_power_profile?alarmProfileLabel(x.alarm_power_profile):'Profilo non registrato';
     const cloud=x.cloud_status==='SYNCED'?'Drive sincronizzato':(x.cloud_status==='ERROR'?'Cloud errore':(x.cloud_status||'Locale'));
-    return '<div class="card alarm-gallery-card" onclick="openAlarmModal('+i+')">'+
+    return '<div class="alarm-gallery-card" onclick="openAlarmModal('+i+')">'+
       '<img class="alarm-gallery-image" loading="lazy" src="'+esc(x.image_url)+'" alt="Foto allarme '+esc(x.camera_id||'')+'">'+
       '<div class="alarm-gallery-body">'+
         '<div class="alarm-gallery-time">'+esc(alarmClock(x.captured_at))+' · '+esc(x.camera_id||'CAM')+'</div>'+
