@@ -2,7 +2,7 @@
 
 CamHub is the Raspberry Pi server for the CamNode ESP32-CAM project.
 
-## Current version: 2.2.0
+## Current version: 2.3.0
 
 CamHub 2.x uses an acknowledged state-machine protocol with CamNode 1.x. The complete contract is in `CAMERA_ARCHITECTURE_V2.md`.
 
@@ -704,3 +704,28 @@ These controls are enabled only while a CamNode 1.2+ camera is READY in Alarm mo
 The overview includes a modern recent-alarm feed with the latest alarm media, thumbnail when available, timestamp, camera, stored alarm profile and cloud state. Alarm JPEG/video metadata records the alarm power profile for new events.
 
 The dashboard also receives a visual refresh with softer panels, clearer status hierarchy and improved camera-management controls.
+
+
+## CamHub 2.3
+
+A dedicated Allarmi page provides a fast visual review of alarm evidence by day.
+
+Features:
+
+    date selector with previous day / today / next day
+    optional camera filter
+    all alarm JPEGs for the selected day
+    three large photos per row on desktop
+    responsive two/one-column layout on smaller screens
+    alarm time, camera, power profile and cloud state on each card
+    video-available badge when the matching alarm video exists
+
+Selecting a photo opens a large review overlay. The reviewer can switch from the still image to the associated alarm video without leaving the page and can move through the day's images with previous/next controls or the left/right keyboard arrows.
+
+The API endpoint:
+
+    GET /api/alarms?date=YYYY-MM-DD&camera_id=CAM01
+
+searches the archive directory for the requested day rather than loading the entire media history. Alarm photos are associated with the nearest alarm video from the same camera within the same trigger window.
+
+This is a CamHub-only feature. It does not change the CamNode protocol, heartbeat model, camera state machine or OTA flow.
