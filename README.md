@@ -146,6 +146,24 @@ Default cloud protection:
 
 These values can be changed from the dashboard.
 
+## Live cleanup report and cloud upload ledger
+
+CamHub 2.5.0 makes SD cleanup observable and adds persistent archive counters.
+
+The Cloud page now starts cleanup as a tracked background job and shows a scrolling live report. The report includes the exact cutoff, local file interval, candidate count, files excluded because they are newer, per-file cloud verification, upload/re-upload, manifest verification, local deletion and the final byte count freed.
+
+CamHub also stores a local cloud-index.json ledger keyed by the unique relative media path. A successful normal upload records the media once. A cleanup verification upgrades that record with a verification timestamp. Re-uploading the same path updates the same record rather than increasing the media count.
+
+The Overview status now exposes:
+
+- image/video media currently present on the SD and their bytes
+- total CamHub archive files and bytes
+- SD filesystem used, total and free space
+- unique image/video media recorded by CamHub as sent to cloud
+- how many of those media have later been checksum-verified
+
+The cloud counter is deliberately a CamHub ledger, not a full Google Drive recount. Manual deletion directly in Drive does not decrement it.
+
 ## Safe local retention and SD cleanup
 
 CamHub 2.4.0 adds cloud-verified local cleanup. The retention period can be selected from the Cloud page.

@@ -31,6 +31,7 @@ OTA_MANIFEST_PATH = FIRMWARE_DIR / "camnode-manifest.json"
 OTA_FIRMWARE_PATH = FIRMWARE_DIR / "camnode-current.bin"
 OTA_JOBS_PATH = FIRMWARE_DIR / "ota-jobs.json"
 ERROR_STATE_PATH = BASE_DIR / "error-state.json"
+CLOUD_INDEX_PATH = BASE_DIR / "cloud-index.json"
 OTA_SLOT_SIZE = 0x1E0000
 
 DATA_DIR.mkdir(exist_ok=True)
@@ -38,7 +39,7 @@ NODES_DIR.mkdir(exist_ok=True)
 FIRMWARE_DIR.mkdir(exist_ok=True)
 (FIRMWARE_DIR / "archive").mkdir(exist_ok=True)
 
-app = FastAPI(title="CamHub", version="2.4.0")
+app = FastAPI(title="CamHub", version="2.5.0")
 config_lock = threading.RLock()
 cloud_lock = threading.Lock()
 cloud_event = threading.Event()
@@ -46,6 +47,22 @@ cloud_worker_started = False
 cloud_backoff_until = 0.0
 cloud_backoff_reason = ""
 cloud_backoff_lock = threading.RLock()
+cloud_index_lock = threading.RLock()
+cleanup_job_lock = threading.RLock()
+cleanup_job_seq = 0
+cleanup_job: dict[str, Any] = {
+    "job_id": 0,
+    "running": False,
+    "status": "idle",
+    "days": None,
+    "cutoff": None,
+    "started_at": None,
+    "finished_at": None,
+    "result": None,
+    "error": None,
+    "logs": [],
+    "log_seq": 0,
+}
 
 stream_frame_lock = threading.RLock()
 stream_frame_cache: dict[str, dict[str, Any]] = {}
@@ -209,6 +226,198 @@ def load_config() -> dict[str, Any]:
 
 def now_local() -> datetime:
     return datetime.now().astimezone()
+
+
+def load_cloud_index() -> dict[str, Any]:
+    with cloud_index_lock:
+        if not CLOUD_INDEX_PATH.exists():
+            return {
+                "version": 1,
+                "updated_at": None,
+                "files": {},
+            }
+        try:
+            data = json.loads(
+                CLOUD_INDEX_PATH.read_text(encoding="utf-8")
+            )
+            if not isinstance(data, dict):
+                raise ValueError("invalid cloud index")
+            files = data.get("files")
+            if not isinstance(files, dict):
+                files = {}
+            return {
+                "version": 1,
+                "updated_at": data.get("updated_at"),
+                "files": files,
+            }
+        except Exception:
+            return {
+                "version": 1,
+                "updated_at": None,
+                "files": {},
+            }
+
+
+def save_cloud_index(index: dict[str, Any]) -> None:
+    with cloud_index_lock:
+        index["version"] = 1
+        index["updated_at"] = now_local().isoformat()
+        tmp = CLOUD_INDEX_PATH.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(index, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(CLOUD_INDEX_PATH)
+
+
+def remember_cloud_media(
+    paths: list[Path] | set[Path],
+    *,
+    verified: bool,
+    source: str,
+) -> None:
+    if not paths:
+        return
+
+    with cloud_index_lock:
+        index = load_cloud_index()
+        entries = index.setdefault("files", {})
+        changed = False
+        timestamp = now_local().isoformat()
+
+        for path in paths:
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                relative = path.relative_to(DATA_DIR).as_posix()
+            except ValueError:
+                continue
+
+            meta = read_metadata(path)
+            existing = dict(entries.get(relative) or {})
+            first_seen = (
+                existing.get("first_cloud_at")
+                or meta.get("cloud_synced_at")
+                or timestamp
+            )
+            sha = str(
+                meta.get("sha256")
+                or existing.get("sha256")
+                or ""
+            )
+            if not sha:
+                try:
+                    sha = sha256_file(path)
+                except Exception:
+                    sha = ""
+
+            entry = {
+                **existing,
+                "relative": relative,
+                "filename": path.name,
+                "size": int(path.stat().st_size),
+                "sha256": sha,
+                "media_type": meta.get(
+                    "media_type",
+                    (
+                        "video"
+                        if path.suffix.lower() == ".mp4"
+                        else (
+                            "error"
+                            if path.suffix.lower() == ".txt"
+                            else "image"
+                        )
+                    ),
+                ),
+                "camera_id": meta.get("camera_id"),
+                "captured_at": meta.get("captured_at"),
+                "first_cloud_at": first_seen,
+                "last_cloud_at": timestamp,
+                "last_source": source,
+            }
+            if verified:
+                entry["last_verified_at"] = timestamp
+            entries[relative] = entry
+            changed = True
+
+        if changed:
+            save_cloud_index(index)
+
+
+def backfill_cloud_index_from_local() -> None:
+    synced: list[Path] = []
+    for path in media_files():
+        if read_metadata(path).get("cloud_status") == "SYNCED":
+            synced.append(path)
+    remember_cloud_media(
+        synced,
+        verified=False,
+        source="metadata_backfill",
+    )
+
+
+def cloud_index_stats() -> dict[str, Any]:
+    index = load_cloud_index()
+    entries = list((index.get("files") or {}).values())
+    media_entries = [
+        item
+        for item in entries
+        if str(item.get("media_type") or "") in {"image", "video"}
+    ]
+    return {
+        "known_files": len(entries),
+        "known_media": len(media_entries),
+        "known_media_bytes": sum(
+            max(0, int(item.get("size") or 0))
+            for item in media_entries
+        ),
+        "verified_media": sum(
+            1
+            for item in media_entries
+            if item.get("last_verified_at")
+        ),
+        "updated_at": index.get("updated_at"),
+    }
+
+
+def _cleanup_job_log(
+    job_id: int,
+    message: str,
+    level: str = "info",
+) -> None:
+    with cleanup_job_lock:
+        if int(cleanup_job.get("job_id") or 0) != int(job_id):
+            return
+        cleanup_job["log_seq"] = int(
+            cleanup_job.get("log_seq") or 0
+        ) + 1
+        cleanup_job.setdefault("logs", []).append({
+            "seq": cleanup_job["log_seq"],
+            "time": now_local().isoformat(),
+            "level": level,
+            "message": str(message),
+        })
+        # Keep a generous live history without allowing unbounded RAM use.
+        cleanup_job["logs"] = cleanup_job["logs"][-5000:]
+
+
+def cleanup_job_status(
+    after_seq: int = 0,
+) -> dict[str, Any]:
+    with cleanup_job_lock:
+        state = {
+            key: value
+            for key, value in cleanup_job.items()
+            if key != "logs"
+        }
+        state["logs"] = [
+            dict(item)
+            for item in cleanup_job.get("logs", [])
+            if int(item.get("seq") or 0) > max(0, after_seq)
+        ]
+        return state
+
+
 
 
 def load_ota_manifest() -> dict[str, Any] | None:
@@ -2671,29 +2880,49 @@ def _prune_empty_data_dirs() -> None:
 def safe_cloud_cleanup(
     cutoff: datetime,
     cfg: dict[str, Any],
+    log: Any | None = None,
 ) -> dict[str, Any]:
     """
     Free local storage without ever deleting the only verified media copy.
 
-    Workflow:
-      1. select media older than cutoff;
-      2. compare local media with Drive using rclone check (size + hash);
-      3. upload missing/different media with checksum comparison;
-      4. verify the media again;
-      5. sync and verify its manifest;
-      6. delete local media + manifest only after both remote checks match.
+    The optional logger receives (message, level) and is used by the dashboard
+    to show every cleanup phase while it happens.
     """
-    candidates = sorted(
-        (
-            path
-            for path in media_files()
-            if _media_time_for_cleanup(path) < cutoff
-        ),
+    def report(message: str, level: str = "info") -> None:
+        if log is not None:
+            try:
+                log(message, level)
+            except Exception:
+                pass
+
+    all_local = sorted(
+        media_files(),
         key=_media_time_for_cleanup,
+    )
+    candidates = [
+        path
+        for path in all_local
+        if _media_time_for_cleanup(path) < cutoff
+    ]
+    too_recent = len(all_local) - len(candidates)
+
+    oldest_at = (
+        _media_time_for_cleanup(all_local[0]).isoformat()
+        if all_local
+        else None
+    )
+    newest_at = (
+        _media_time_for_cleanup(all_local[-1]).isoformat()
+        if all_local
+        else None
     )
 
     result: dict[str, Any] = {
         "cutoff": cutoff.isoformat(),
+        "total_local_files": len(all_local),
+        "too_recent": too_recent,
+        "oldest_local_at": oldest_at,
+        "newest_local_at": newest_at,
         "candidates": len(candidates),
         "verified_existing": 0,
         "uploaded_verified": 0,
@@ -2702,13 +2931,54 @@ def safe_cloud_cleanup(
         "freed_bytes": 0,
         "failures": [],
     }
+
+    report(
+        (
+            f"Analisi SD: {len(all_local)} file archivio locali. "
+            f"Cutoff: {cutoff.isoformat()}."
+        )
+    )
+    if oldest_at:
+        report(
+            (
+                f"Intervallo locale: più vecchio {oldest_at}, "
+                f"più recente {newest_at}."
+            )
+        )
+    report(
+        (
+            f"Candidati alla rimozione: {len(candidates)}. "
+            f"Esclusi perché più recenti: {too_recent}."
+        )
+    )
+
     if not candidates:
+        report(
+            (
+                "Nessun file è precedente al cutoff. "
+                "Non è stato cancellato nulla."
+            ),
+            "warning",
+        )
         return result
 
     failures: list[dict[str, str]] = []
     now_synced = now_local().isoformat()
 
+    for path in candidates:
+        report(
+            (
+                "CANDIDATO "
+                + path.relative_to(DATA_DIR).as_posix()
+                + f" · {_media_time_for_cleanup(path).isoformat()}"
+                + f" · {path.stat().st_size} byte"
+            )
+        )
+
     with cloud_lock:
+        report(
+            f"Verifica cloud iniziale di {len(candidates)} file..."
+        )
         matched, statuses, check_detail = _rclone_check_batch(
             candidates,
             cfg,
@@ -2720,6 +2990,20 @@ def safe_cloud_cleanup(
         }
         result["verified_existing"] = len(initial_verified)
 
+        for path in candidates:
+            relative = path.relative_to(DATA_DIR).as_posix()
+            if path in initial_verified:
+                report(f"CLOUD OK {relative}", "ok")
+            else:
+                status = statuses.get(relative, "!")
+                report(
+                    (
+                        f"CLOUD NON VERIFICATO {relative} "
+                        f"· stato rclone {status} · verrà caricato"
+                    ),
+                    "warning",
+                )
+
         needs_upload = [
             path
             for path in candidates
@@ -2728,10 +3012,24 @@ def safe_cloud_cleanup(
 
         verified_media = set(initial_verified)
         if needs_upload:
+            report(
+                (
+                    f"Upload/ripristino di {len(needs_upload)} file "
+                    "non ancora verificati..."
+                )
+            )
             upload_ok, upload_detail = _rclone_batch(
                 needs_upload,
                 cfg,
                 checksum=True,
+            )
+            report(
+                (
+                    "Upload terminato con successo."
+                    if upload_ok
+                    else "Upload ha restituito un errore. Verifico comunque i singoli file."
+                ),
+                "ok" if upload_ok else "warning",
             )
             matched_after, statuses_after, recheck_detail = (
                 _rclone_check_batch(needs_upload, cfg)
@@ -2752,21 +3050,31 @@ def safe_cloud_cleanup(
                 )
 
             for path in needs_upload:
-                if path in newly_verified:
-                    continue
                 relative = path.relative_to(DATA_DIR).as_posix()
+                if path in newly_verified:
+                    report(
+                        f"UPLOAD + VERIFICA OK {relative}",
+                        "ok",
+                    )
+                    continue
+
                 status = statuses_after.get(
                     relative,
                     statuses.get(relative, "!"),
                 )
+                reason = (
+                    "Cloud copy could not be verified "
+                    f"(rclone status {status})."
+                )
                 failures.append({
                     "file": relative,
                     "stage": "media",
-                    "reason": (
-                        "Cloud copy could not be verified "
-                        f"(rclone status {status})."
-                    ),
+                    "reason": reason,
                 })
+                report(
+                    f"MANTENUTO SU SD {relative} · {reason}",
+                    "error",
+                )
                 if _existing_metadata_path(path) is not None:
                     update_metadata(
                         path,
@@ -2779,20 +3087,37 @@ def safe_cloud_cleanup(
                         )[-3000:],
                         cloud_error_at=now_synced,
                     )
+        else:
+            report(
+                "Tutti i file candidati risultano già presenti e verificati sul cloud.",
+                "ok",
+            )
+
+        remember_cloud_media(
+            verified_media,
+            verified=True,
+            source="cleanup_verify",
+        )
 
         manifest_files: list[Path] = []
         media_for_manifest: dict[str, Path] = {}
 
+        report("Preparazione e verifica manifest JSON...")
         for path in verified_media:
+            relative = path.relative_to(DATA_DIR).as_posix()
             if _existing_metadata_path(path) is None:
-                relative = path.relative_to(DATA_DIR).as_posix()
+                reason = (
+                    "Local manifest is missing. Media was kept locally."
+                )
                 failures.append({
                     "file": relative,
                     "stage": "manifest",
-                    "reason": (
-                        "Local manifest is missing. Media was kept locally."
-                    ),
+                    "reason": reason,
                 })
+                report(
+                    f"MANTENUTO SU SD {relative} · manifest locale assente",
+                    "error",
+                )
                 continue
 
             update_metadata(
@@ -2811,6 +3136,9 @@ def safe_cloud_cleanup(
         manifest_matched: set[str] = set()
         manifest_detail = ""
         if manifest_files:
+            report(
+                f"Sincronizzo {len(manifest_files)} manifest sul cloud..."
+            )
             manifest_upload_ok, manifest_upload_detail = _rclone_batch(
                 manifest_files,
                 cfg,
@@ -2819,6 +3147,17 @@ def safe_cloud_cleanup(
             manifest_matched, _, manifest_detail = _rclone_check_batch(
                 manifest_files,
                 cfg,
+            )
+            report(
+                (
+                    f"Manifest verificati: {len(manifest_matched)} "
+                    f"su {len(manifest_files)}."
+                ),
+                (
+                    "ok"
+                    if len(manifest_matched) == len(manifest_files)
+                    else "warning"
+                ),
             )
             if not manifest_upload_ok:
                 record_runtime_error(
@@ -2829,19 +3168,28 @@ def safe_cloud_cleanup(
 
         deletable: list[Path] = []
         for manifest_relative, media_path in media_for_manifest.items():
+            relative = media_path.relative_to(DATA_DIR).as_posix()
             if manifest_relative in manifest_matched:
                 deletable.append(media_path)
+                report(
+                    f"PRONTO ALLA CANCELLAZIONE {relative} · media e manifest verificati",
+                    "ok",
+                )
                 continue
 
-            relative = media_path.relative_to(DATA_DIR).as_posix()
+            reason = (
+                "Cloud manifest could not be verified. "
+                "Media was kept locally."
+            )
             failures.append({
                 "file": relative,
                 "stage": "manifest",
-                "reason": (
-                    "Cloud manifest could not be verified. "
-                    "Media was kept locally."
-                ),
+                "reason": reason,
             })
+            report(
+                f"MANTENUTO SU SD {relative} · manifest cloud non verificato",
+                "error",
+            )
             update_metadata(
                 media_path,
                 cloud_status="ERROR",
@@ -2854,30 +3202,44 @@ def safe_cloud_cleanup(
 
         freed_bytes = 0
         deleted = 0
+        report(
+            f"Cancellazione locale autorizzata per {len(deletable)} file..."
+        )
         for path in deletable:
+            relative = path.relative_to(DATA_DIR).as_posix()
             try:
+                item_bytes = 0
                 if path.exists():
-                    freed_bytes += path.stat().st_size
+                    item_bytes += path.stat().st_size
                 current_meta = metadata_path(path)
                 legacy_meta = legacy_metadata_path(path)
                 if current_meta.exists():
-                    freed_bytes += current_meta.stat().st_size
+                    item_bytes += current_meta.stat().st_size
                 if (
                     legacy_meta.exists()
                     and legacy_meta != current_meta
                 ):
-                    freed_bytes += legacy_meta.stat().st_size
+                    item_bytes += legacy_meta.stat().st_size
 
                 current_meta.unlink(missing_ok=True)
                 legacy_meta.unlink(missing_ok=True)
                 path.unlink(missing_ok=True)
+                freed_bytes += item_bytes
                 deleted += 1
+                report(
+                    f"CANCELLATO DA SD {relative} · liberati {item_bytes} byte",
+                    "ok",
+                )
             except Exception as exc:
                 failures.append({
-                    "file": path.relative_to(DATA_DIR).as_posix(),
+                    "file": relative,
                     "stage": "delete",
                     "reason": str(exc),
                 })
+                report(
+                    f"ERRORE CANCELLAZIONE {relative} · {exc}",
+                    "error",
+                )
 
         _prune_empty_data_dirs()
 
@@ -2885,6 +3247,17 @@ def safe_cloud_cleanup(
     result["kept"] = len(candidates) - deleted
     result["freed_bytes"] = freed_bytes
     result["failures"] = failures[:100]
+
+    report(
+        (
+            f"FINE: candidati {len(candidates)}, "
+            f"già verificati {result['verified_existing']}, "
+            f"caricati e verificati {result['uploaded_verified']}, "
+            f"cancellati {deleted}, mantenuti {result['kept']}, "
+            f"byte liberati {freed_bytes}."
+        ),
+        "ok" if not failures else "warning",
+    )
 
     if failures:
         record_runtime_error(
@@ -2897,6 +3270,99 @@ def safe_cloud_cleanup(
         )
 
     return result
+
+
+def _run_cloud_cleanup_job(
+    job_id: int,
+    retention_days: int,
+) -> None:
+    try:
+        cfg = load_config()
+        cutoff = now_local() - timedelta(days=retention_days)
+        with cleanup_job_lock:
+            if int(cleanup_job.get("job_id") or 0) == job_id:
+                cleanup_job["cutoff"] = cutoff.isoformat()
+
+        _cleanup_job_log(
+            job_id,
+            (
+                f"Avvio pulizia sicura. Periodo: {retention_days} giorno/i. "
+                f"Verranno considerati i file precedenti a {cutoff.isoformat()}."
+            ),
+        )
+
+        result = safe_cloud_cleanup(
+            cutoff,
+            cfg,
+            log=lambda message, level="info": _cleanup_job_log(
+                job_id,
+                message,
+                level,
+            ),
+        )
+        result["retention_days"] = retention_days
+
+        with cleanup_job_lock:
+            if int(cleanup_job.get("job_id") or 0) == job_id:
+                cleanup_job["running"] = False
+                cleanup_job["status"] = "completed"
+                cleanup_job["finished_at"] = now_local().isoformat()
+                cleanup_job["result"] = result
+                cleanup_job["error"] = None
+    except Exception as exc:
+        record_runtime_error("cloud_cleanup_job", str(exc))
+        _cleanup_job_log(
+            job_id,
+            f"ERRORE OPERAZIONE: {exc}. Nessun file non verificato viene cancellato.",
+            "error",
+        )
+        with cleanup_job_lock:
+            if int(cleanup_job.get("job_id") or 0) == job_id:
+                cleanup_job["running"] = False
+                cleanup_job["status"] = "error"
+                cleanup_job["finished_at"] = now_local().isoformat()
+                cleanup_job["error"] = str(exc)
+
+
+def start_cloud_cleanup(
+    retention_days: int,
+) -> dict[str, Any]:
+    global cleanup_job_seq, cleanup_job
+
+    with cleanup_job_lock:
+        if cleanup_job.get("running"):
+            raise HTTPException(
+                409,
+                (
+                    "A safe cleanup is already running "
+                    f"(job {cleanup_job.get('job_id')})."
+                ),
+            )
+
+        cleanup_job_seq += 1
+        job_id = cleanup_job_seq
+        cleanup_job = {
+            "job_id": job_id,
+            "running": True,
+            "status": "running",
+            "days": retention_days,
+            "cutoff": None,
+            "started_at": now_local().isoformat(),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+            "logs": [],
+            "log_seq": 0,
+        }
+
+    threading.Thread(
+        target=_run_cloud_cleanup_job,
+        args=(job_id, retention_days),
+        daemon=True,
+        name=f"camhub-cleanup-{job_id}",
+    ).start()
+
+    return cleanup_job_status()
 
 
 def sync_pending_batch() -> int:
@@ -2954,6 +3420,11 @@ def sync_pending_batch() -> int:
             return 0
 
         synced_at = now_local().isoformat()
+        remember_cloud_media(
+            pending,
+            verified=False,
+            source="automatic_upload",
+        )
         meta_files: list[Path] = []
         for path in pending:
             update_metadata(
@@ -3321,6 +3792,7 @@ def startup_event() -> None:
             pass
 
     load_ota_jobs()
+    backfill_cloud_index_from_local()
     ensure_cloud_worker()
     ensure_camera_operation_worker()
     ensure_automatic_snapshot_scheduler()
@@ -5460,25 +5932,60 @@ def clear_visible_errors():
 def api_status():
     cfg = load_config()
     files = media_files()
+    actual_media = [
+        path
+        for path in files
+        if path.suffix.lower() in {".jpg", ".jpeg", ".mp4"}
+    ]
     total_bytes = sum(path.stat().st_size for path in files)
-    pending = sum(1 for path in files if read_metadata(path).get("cloud_status") in ("PENDING", "ERROR", "UPLOADING"))
+    actual_media_bytes = sum(
+        path.stat().st_size
+        for path in actual_media
+    )
+    pending = sum(
+        1
+        for path in files
+        if read_metadata(path).get("cloud_status")
+        in ("PENDING", "ERROR", "UPLOADING")
+    )
     latest = latest_jpg()
     backoff = cloud_backoff_status()
+    cloud_stats = cloud_index_stats()
+    disk = shutil.disk_usage(DATA_DIR)
     return {
         "camhub_version": app.version,
         "server_name": cfg["server_name"],
         "media_count": len(files),
         "data_mb": round(total_bytes / 1024 / 1024, 2),
+        "local_media_count": len(actual_media),
+        "local_media_bytes": actual_media_bytes,
+        "local_archive_files": len(files),
+        "local_archive_bytes": total_bytes,
+        "sd_total_bytes": disk.total,
+        "sd_used_bytes": disk.used,
+        "sd_free_bytes": disk.free,
+        "cloud_known_media_count": cloud_stats["known_media"],
+        "cloud_known_media_bytes": cloud_stats["known_media_bytes"],
+        "cloud_verified_media_count": cloud_stats["verified_media"],
+        "cloud_index_updated_at": cloud_stats["updated_at"],
         "rclone_available": shutil.which("rclone") is not None,
         "drive_enabled": cfg.get("drive_enabled", False),
         "pending_cloud": pending,
         "cloud_backoff": backoff,
-        "drive_custom_oauth": has_custom_drive_oauth(str(cfg.get("drive_remote") or "gdrive")),
+        "drive_custom_oauth": has_custom_drive_oauth(
+            str(cfg.get("drive_remote") or "gdrive")
+        ),
         "camera_mode": cfg.get("camera_mode", "automatic"),
         "camera_queue": camera_operation_status(),
-        "streaming": streaming_mode_status(str(cfg.get("camera_id") or "CAM01")),
+        "streaming": streaming_mode_status(
+            str(cfg.get("camera_id") or "CAM01")
+        ),
         "latest_name": latest.name if latest else None,
-        "latest_url": f"/data/{latest.relative_to(DATA_DIR).as_posix()}" if latest else None,
+        "latest_url": (
+            f"/data/{latest.relative_to(DATA_DIR).as_posix()}"
+            if latest
+            else None
+        ),
         "errors": error_summary(),
     }
 
@@ -5658,16 +6165,18 @@ def cloud_cleanup(days: int | None = None):
             ),
         ),
     )
-    cutoff = now_local() - timedelta(days=retention_days)
-    cleanup = safe_cloud_cleanup(cutoff, cfg)
-    cleanup["retention_days"] = retention_days
-    return cleanup
+    return start_cloud_cleanup(retention_days)
+
+
+@app.get("/api/cloud/cleanup/status")
+def cloud_cleanup_status(after_seq: int = 0):
+    return cleanup_job_status(after_seq=max(0, int(after_seq)))
 
 
 @app.post("/api/maintenance/cleanup")
 def cleanup_retention(days: int | None = None):
-    # Backward-compatible endpoint used by the Overview page. It now uses the
-    # same verified cloud-first deletion path as the Cloud page.
+    # Backward-compatible entry point. It starts the exact same tracked,
+    # cloud-verified cleanup used by the Cloud page.
     return cloud_cleanup(days)
 
 
